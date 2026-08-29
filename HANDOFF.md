@@ -206,3 +206,81 @@ devDependency. The v1 path is the live one, which also matches the original bug 
 | Build | `bun run build` → `dist/server.js` (must be committed here) |
 | Wire-up | local file path — OpenCode's `plugin` array takes neither `github:` nor a bare package name |
 | State file | `~/.local/share/opencode-goal-plugin/goals.json` |
+
+---
+
+## 7. `question_policy` — no questions while a goal is active (2026-08-29)
+
+**Ask:** while a goal is active, opencode should stop asking the user questions — or, if it is
+about to, be told to recommend an answer and go with it.
+
+**Shipped:** a `question_policy` option, `"allow" | "decide" | "deny"`, defaulting to `"decide"`.
+It is in force only while `goal.status === "active"`; a paused, limited, or closed goal — or a
+session with no goal — asks questions exactly as before. README documents it under
+*Questions While A Goal Is Active*.
+
+### What was proven, and how
+
+The design turned on two questions about opencode 1.18.23 that could not be answered from the
+plugin API types. Both were settled against the shipped binary and a live run, not inferred.
+
+1. **Throwing from `tool.execute.before` is safe and the message reaches the model.** The bundle's
+   hook dispatcher has no try/catch (`for (let H of B.hooks) { ... yield* v.promise(async () => V(K,U)) }`),
+   so the rejection travels out of the tool's `execute` into the ai-sdk tool executor, which turns
+   it into a `tool-error` part carrying `error.message`. Confirmed live: a throwaway plugin that
+   throws for the `read` tool produced `✗ Read hello.txt failed`, the model quoted the thrown
+   message back verbatim, and `opencode run` exited **0**. The turn survives; one tool call fails.
+2. **The end-to-end behaviour is what was asked for.** A real `opencode run` against the built
+   plugin, with a goal set and the policy at its default, answered:
+   *"with the goal now active the question policy blocks asking entirely (this goal runs
+   unattended). Per that policy, I decided instead: sort by name (stable, conventional default).
+   Assumption recorded — say the word and I'll switch to date."*
+
+### Two mechanisms were rejected, both for the same reason
+
+Neither can be made conditional on *this session's* goal, so neither can lift when a goal pauses.
+
+- **Registering a plugin tool with the id `question`.** It does override the built-in — the registry
+  is an object keyed by tool id and the plugin entry is appended last, so it simply wins, with no
+  collision check. But plugin tools are registered once per process, so it would replace the tool in
+  every session.
+- **The `permission.ask` hook.** Written, then removed. It is *unreachable*: the runtime fires
+  `tool.execute.before` and only then the tool's own `execute`, and the question permission assert
+  lives inside that `execute`, so the throw always pre-empts it. It is also the wrong shape — a
+  declined permission becomes an Effect defect (`catchTag("PermissionV2.DeclinedError", $ => n.die($))`)
+  rather than a recoverable tool error, so denying there risks killing the turn instead of failing
+  one call.
+
+Config-level `"permission": {"question": "deny"}` and `"tools": {"question": false}` both exist and
+both work; they are unconditional, and they answer the model with a bare `Permission denied:
+question` instead of telling it what to do instead. The README points at them for the user who never
+wants questions at all.
+
+### Enforcement layers
+
+| Layer | v1 | v2 |
+|---|---|---|
+| Policy text in the system reminder | ✅ `experimental.chat.system.transform` | ✅ `session.hook("context")` |
+| Tool hidden from the model | ✗ no per-session tool list | ✅ `delete sessionContext.tools.question` |
+| Call blocked | ✅ throw from `tool.execute.before` | ✅ throw from `tool.hook("execute.before")` |
+
+The v1/v2 args shape differs and is easy to get wrong: v1 reads `output.args`, v2 reads `input.input`.
+
+### Audit trail
+
+Every block increments `goal.questionsSuppressed` and writes a history entry naming the question.
+The history entry deliberately reuses the existing `"warning"` type: adding a literal to the history
+union would make a newer state file undecodable by an older plugin, and `readStateEffect` only falls
+back to an empty state on `ENOENT` — a `StateDecodeError` re-raises, so every read would fail and a
+downgraded plugin would see no goals at all. The counter is a plain number, which Effect Schema
+tolerates in both directions.
+
+### Still open
+
+- The **throw** path has not been exercised end-to-end. `opencode run` (the `cli` client) did not
+  register a `question` tool at all, so the live probe proved only the prevention layer; the throw
+  mechanism itself was proven separately against the `read` tool. Confirming it needs an interactive
+  TUI session where the tool exists.
+- The probe model reached first for an **`ask-me` skill** before concluding it could not ask. The
+  policy text was broadened to name every route to the user, not just the tool, but a skill that
+  asks is not blocked by anything — only discouraged.

@@ -301,10 +301,26 @@ OpenCode goal mode policy:
 - In Plan mode or another restricted agent, do not perform implementation work, run state-changing commands, or resume a goal unless plugin configuration explicitly allows goal execution there.`,
     ],
   }
-  const transform = async (sessionID: string) => {
+  // While a goal is ACTIVE the reminder also carries the question policy. It is
+  // a second byte-stable constant, not a second source of leakage: the same
+  // no-leak assertions run against it at the end of this test.
+  const expectedActive = {
+    system: [
+      `${expected.system[0]}
+
+Question policy while this goal is active:
+- Do not call the question tool. It is blocked and the call will fail.
+- The same goes for every other route to the user: no ask-the-user skill or command, no question in prose, and no turn that ends by waiting for an answer. This goal runs unattended and nobody is watching the terminal.
+- When you would have asked, decide instead: pick the answer you would have recommended, say in one line what you chose and why, and continue.
+- Prefer the reading a careful colleague would take: the worktree, the objective, and the conventions already in the code you are changing are your evidence.
+- Record the decision as an assumption in your turn summary so the user can correct it later. A stated assumption the user can override is worth more than a stalled turn.
+- Reserve update_goal with status "unmet" for a real impasse, not for a choice you could make and flag.`,
+    ],
+  }
+  const transform = async (sessionID: string, active = false) => {
     const output = { system: ["Base system prompt"] }
     await hooks["experimental.chat.system.transform"]!({ sessionID } as never, output)
-    expect(output).toEqual(expected)
+    expect(output).toEqual(active ? expectedActive : expected)
     return output
   }
 
@@ -331,7 +347,7 @@ OpenCode goal mode policy:
     )
     expect(String(created)).toContain('"objective": "OBJECTIVE_SHOULD_NOT_LEAK_7f31"')
     expect(String(created)).toContain('"status": "active"')
-    await transform("ses_lifecycle")
+    await transform("ses_lifecycle", true)
 
     setSystemTime(new Date(105_000))
     await hooks["experimental.chat.messages.transform"]!(
@@ -353,22 +369,22 @@ OpenCode goal mode policy:
     expect(String(read)).toContain('"tokensUsed": 0')
     expect(String(read)).toContain('"timeUsedSeconds": 5')
     expect(String(read)).toContain("CHECKPOINT_SHOULD_NOT_LEAK_4b72")
-    await transform("ses_lifecycle")
+    await transform("ses_lifecycle", true)
 
     await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "paused" }, context)
     await transform("ses_lifecycle")
     await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "active" }, context)
-    await transform("ses_lifecycle")
+    await transform("ses_lifecycle", true)
 
     await requireTool(tools.update_goal_objective, "update_goal_objective").execute(
       { objective: "REPLACED_OBJECTIVE_SHOULD_NOT_LEAK_5e93", status: "active" },
       context,
     )
-    await transform("ses_lifecycle")
+    await transform("ses_lifecycle", true)
 
-    const repeated = await transform("ses_lifecycle")
+    const repeated = await transform("ses_lifecycle", true)
     await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_lifecycle" } as never, repeated)
-    expect(repeated).toEqual(expected)
+    expect(repeated).toEqual(expectedActive)
     expect(repeated.system[0]?.match(/OpenCode goal mode policy:/g)?.length).toBe(1)
 
     await requireTool(tools.update_goal, "update_goal").execute(
@@ -381,7 +397,7 @@ OpenCode goal mode policy:
       { objective: "DIFFERENT_OBJECTIVE_SHOULD_NOT_LEAK_8c42" },
       context,
     )
-    await transform("ses_lifecycle")
+    await transform("ses_lifecycle", true)
     await requireTool(tools.update_goal, "update_goal").execute(
       { status: "unmet", blocker: "BLOCKER_SHOULD_NOT_LEAK_6d04" },
       context,
@@ -455,6 +471,17 @@ OpenCode goal mode policy:
     expect(expected.system[0]).not.toContain("BLOCKER_SHOULD_NOT_LEAK")
     expect(expected.system[0]).not.toContain("CHECKPOINT_SHOULD_NOT_LEAK")
     expect(expected.system[0]).not.toContain("REPLACED_OBJECTIVE_SHOULD_NOT_LEAK")
+    for (const marker of [
+      "OBJECTIVE_SHOULD_NOT_LEAK",
+      "987654",
+      "460",
+      "timeUsedSeconds",
+      "BLOCKER_SHOULD_NOT_LEAK",
+      "CHECKPOINT_SHOULD_NOT_LEAK",
+      "REPLACED_OBJECTIVE_SHOULD_NOT_LEAK",
+    ]) {
+      expect(expectedActive.system[0]).not.toContain(marker)
+    }
   } finally {
     setSystemTime()
   }
@@ -3082,4 +3109,263 @@ test("the public goal tool result never exposes internal pending attempt fields"
   expect(text).not.toContain("pendingAttempt")
   expect(text).not.toContain("pendingContinuationStart")
   expect(text).not.toContain("pendingContinuationStarted")
+})
+
+// Every question-policy test needs the same pair: a server built with a given
+// question_policy, and a session to hang a goal off. Goals are always created
+// through the registered create_goal tool so these tests run the same path the
+// model does rather than writing state behind the plugin's back.
+async function setupQuestionServer(policy?: string, sessionID = "ses_question") {
+  const options: Record<string, unknown> = { auto_continue: false }
+  if (policy !== undefined) options.question_policy = policy
+  const hooks = await setupServer({ client: { session: { promptAsync: async () => {} } } } as never, options as never)
+  const tools = requireTool(hooks.tool, "goal tools")
+  return { hooks, tools, sessionID, context: { sessionID, agent: "build" } as never }
+}
+
+// Returns the message tool.execute.before threw, or null when the call was let
+// through. Returning the text rather than a boolean keeps every gate test
+// asserting on what the model actually reads.
+async function questionBlockMessage(
+  hooks: Awaited<ReturnType<typeof setupQuestionServer>>["hooks"],
+  input: { tool: string; sessionID: string; callID?: string },
+  args?: unknown,
+) {
+  try {
+    await hooks["tool.execute.before"]!({ callID: "call_q", ...input } as never, { args } as never)
+    return null
+  } catch (error) {
+    return (error as Error).message
+  }
+}
+
+// Asserts the call was actually blocked and hands back the message, so a policy
+// that silently lets a question through fails with "expected null to be string"
+// instead of with a cryptic toContain type error.
+function blockedText(message: string | null) {
+  expect(typeof message).toBe("string")
+  return String(message)
+}
+
+test("the default question policy blocks the question tool while a goal is active", async () => {
+  const { hooks, tools, context, sessionID } = await setupQuestionServer()
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+
+  const message = blockedText(
+    await questionBlockMessage(hooks, { tool: "question", sessionID }, {
+      questions: [{ question: "Should I use Postgres or SQLite?" }],
+    }),
+  )
+
+  // The message arrives at the model as the failed tool's error text, so it
+  // leads by naming its own source: without that line a model reads it as tool
+  // output and can dismiss it as untrusted content.
+  expect(message.split("\n")[0]).toBe(
+    "This is a notice from the OpenCode goal-mode plugin, not file content or user input.",
+  )
+  expect(message).toContain("The question tool is disabled while this session goal is active.")
+  expect(message).toContain("Decide instead of asking.")
+  expect(message).toContain("Pick the answer you would have recommended")
+  expect(message).toContain("Do not retry this tool.")
+})
+
+test("an unrecognised question_policy falls back to decide", async () => {
+  // A typo in a config file must neither take the plugin down at load nor
+  // silently disable the gate.
+  const { hooks, tools, context, sessionID } = await setupQuestionServer("sometimes", "ses_bad_policy")
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+
+  const message = blockedText(
+    await questionBlockMessage(hooks, { tool: "question", sessionID }, {
+      questions: [{ question: "Postgres or SQLite?" }],
+    }),
+  )
+  expect(message).toContain("Decide instead of asking.")
+
+  const output = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID } as never, output)
+  expect(output.system[0]).toContain("Question policy while this goal is active:")
+})
+
+test("the block message quotes the question the model was about to ask", async () => {
+  const { hooks, tools, context, sessionID } = await setupQuestionServer()
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+
+  const single = blockedText(
+    await questionBlockMessage(hooks, { tool: "question", sessionID }, {
+      questions: [{ question: "Should I use Postgres or SQLite?" }],
+    }),
+  )
+  expect(single).toContain("Blocked question: Should I use Postgres or SQLite?")
+
+  const both = blockedText(
+    await questionBlockMessage(hooks, { tool: "question", sessionID }, {
+      questions: [{ question: "Postgres or SQLite?" }, { question: "Bun or Node?" }],
+    }),
+  )
+  expect(both).toContain("Blocked question: Postgres or SQLite? | Bun or Node?")
+})
+
+test('question_policy "deny" routes an impasse to update_goal instead of to a guess', async () => {
+  const deny = await setupQuestionServer("deny", "ses_deny")
+  await requireTool(deny.tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, deny.context)
+  const decide = await setupQuestionServer("decide", "ses_decide")
+  await requireTool(decide.tools.create_goal, "create_goal").execute(
+    { objective: "ship it unattended" },
+    decide.context,
+  )
+
+  const args = { questions: [{ question: "Which region should I deploy to?" }] }
+  const denyMessage = blockedText(
+    await questionBlockMessage(deny.hooks, { tool: "question", sessionID: deny.sessionID }, args),
+  )
+  const decideMessage = blockedText(
+    await questionBlockMessage(decide.hooks, { tool: "question", sessionID: decide.sessionID }, args),
+  )
+
+  expect(denyMessage.split("\n")[0]).toBe(
+    "This is a notice from the OpenCode goal-mode plugin, not file content or user input.",
+  )
+  expect(denyMessage).toContain("The question tool is disabled while this session goal is active.")
+  expect(denyMessage).toContain("Blocked question: Which region should I deploy to?")
+  expect(denyMessage).toContain("update_goal")
+  expect(denyMessage).toContain('status "unmet"')
+  expect(denyMessage).not.toContain("Decide instead of asking.")
+  expect(denyMessage).not.toContain("Pick the answer you would have recommended")
+  expect(decideMessage).not.toContain("update_goal")
+  expect(denyMessage).not.toBe(decideMessage)
+})
+
+test('question_policy "allow" leaves the question tool and the system prompt alone', async () => {
+  const { hooks, tools, context, sessionID } = await setupQuestionServer("allow", "ses_allow")
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+
+  expect(
+    await questionBlockMessage(hooks, { tool: "question", sessionID }, {
+      questions: [{ question: "Postgres or SQLite?" }],
+    }),
+  ).toBeNull()
+
+  const output = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID } as never, output)
+  expect(output.system[0]).toContain("OpenCode goal mode policy:")
+  expect(output.system[0]).not.toContain("Question policy while this goal is active:")
+  expect((await getGoal(sessionID))?.questionsSuppressed).toBe(0)
+})
+
+test("a tool other than question is never blocked, under any policy", async () => {
+  for (const policy of ["allow", "decide", "deny"]) {
+    const sessionID = `ses_read_${policy}`
+    const { hooks, tools, context } = await setupQuestionServer(policy, sessionID)
+    await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+
+    expect(await questionBlockMessage(hooks, { tool: "read", sessionID }, { filePath: "src/server.ts" })).toBeNull()
+    // Even a non-question tool carrying question-shaped args stays untouched:
+    // the gate keys off the tool id, not off the payload.
+    expect(
+      await questionBlockMessage(hooks, { tool: "bash", sessionID }, { questions: [{ question: "really?" }] }),
+    ).toBeNull()
+    expect((await getGoal(sessionID))?.questionsSuppressed).toBe(0)
+  }
+})
+
+test("only an active goal blocks questions", async () => {
+  const { hooks, tools, context, sessionID } = await setupQuestionServer()
+
+  // No goal at all: there is no unattended run to protect, so the question tool
+  // is exactly the right thing for the model to reach for.
+  expect(
+    await questionBlockMessage(hooks, { tool: "question", sessionID: "ses_no_goal" }, {
+      questions: [{ question: "Postgres or SQLite?" }],
+    }),
+  ).toBeNull()
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+  await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "paused" }, context)
+  expect(
+    await questionBlockMessage(hooks, { tool: "question", sessionID }, {
+      questions: [{ question: "Postgres or SQLite?" }],
+    }),
+  ).toBeNull()
+  expect((await getGoal(sessionID))?.status).toBe("paused")
+  expect((await getGoal(sessionID))?.questionsSuppressed).toBe(0)
+})
+
+test("the question tool id is matched case- and whitespace-insensitively", async () => {
+  // The id arrives from the runtime rather than from us, so a differently cased
+  // or padded id must not slip past the gate.
+  const { hooks, tools, context, sessionID } = await setupQuestionServer()
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+
+  for (const tool of ["Question", " question ", "QUESTION"]) {
+    const message = blockedText(
+      await questionBlockMessage(hooks, { tool, sessionID }, {
+        questions: [{ question: "Postgres or SQLite?" }],
+      }),
+    )
+    expect(message).toContain("The question tool is disabled while this session goal is active.")
+  }
+  expect((await getGoal(sessionID))?.questionsSuppressed).toBe(3)
+})
+
+test("each blocked question is counted once and named in the goal history", async () => {
+  const { hooks, tools, context, sessionID } = await setupQuestionServer()
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+
+  // tool.execute.before is the only place the block happens, so one blocked
+  // call must move the counter by exactly one: a second recording path would
+  // show up here as a double count.
+  blockedText(
+    await questionBlockMessage(hooks, { tool: "question", sessionID, callID: "call_first" }, {
+      questions: [{ question: "Postgres or SQLite?" }],
+    }),
+  )
+  expect((await getGoal(sessionID))?.questionsSuppressed).toBe(1)
+
+  blockedText(
+    await questionBlockMessage(hooks, { tool: "question", sessionID, callID: "call_second" }, {
+      questions: [{ question: "Deploy to prod now?" }],
+    }),
+  )
+
+  const read = String(await requireTool(tools.get_goal, "get_goal").execute({}, context))
+  expect(read).toContain('"questionsSuppressed": 2')
+
+  const history = String(await requireTool(tools.get_goal_history, "get_goal_history").execute({}, context))
+  expect(history).toContain("Question tool blocked by goal policy: Postgres or SQLite?")
+  expect(history).toContain("Question tool blocked by goal policy: Deploy to prod now?")
+})
+
+test("the question policy leaves the system prompt once the goal stops being active", async () => {
+  const { hooks, tools, context, sessionID } = await setupQuestionServer()
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+
+  const active = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID } as never, active)
+  expect(active.system[0]).toContain("Question policy while this goal is active:")
+  expect(active.system[0]).toContain("decide instead: pick the answer you would have recommended")
+
+  // The policy text is conditional, not a permanent fixture of the prompt: once
+  // the user is back in the loop the model must be free to ask again.
+  await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "paused" }, context)
+  const paused = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID } as never, paused)
+  expect(paused.system[0]).toContain("OpenCode goal mode policy:")
+  expect(paused.system[0]).not.toContain("Question policy while this goal is active:")
+})
+
+test("malformed question arguments still block instead of crashing the gate", async () => {
+  // The args come from the model, so the gate has to survive shapes the tool
+  // schema would never produce. A property-access crash here would reach the
+  // model as a plugin fault instead of as the policy.
+  const { hooks, tools, context, sessionID } = await setupQuestionServer()
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "ship it unattended" }, context)
+
+  const malformed: unknown[] = [undefined, {}, { questions: "nope" }, { questions: [{}] }, { questions: [{ question: 7 }] }]
+  for (const args of malformed) {
+    const message = blockedText(await questionBlockMessage(hooks, { tool: "question", sessionID }, args))
+    expect(message).toContain("The question tool is disabled while this session goal is active.")
+    expect(message).not.toContain("Blocked question:")
+  }
+  expect((await getGoal(sessionID))?.questionsSuppressed).toBe(malformed.length)
 })

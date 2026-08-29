@@ -104,3 +104,54 @@ ${escapeXmlText(formatGoal(goal))}
 
 Preserve the goal objective, status, elapsed time, budget usage, latest checkpoint, and any completion evidence or blocker in the compacted context. After compaction, continue from the next concrete unfinished step only if the goal remains active. Before closing the goal, audit real artifacts and command outputs; close with update_goal status "complete" only with evidence, or status "unmet" only with a concrete blocker.`
 }
+
+export type QuestionPolicy = "allow" | "decide" | "deny"
+
+// The two non-allow policies answer the same problem from opposite ends. A
+// goal runs unattended across many turns, so a question tool call stalls the
+// loop until a human happens to look at the terminal. "decide" keeps the turn
+// moving by making the model commit to the answer it would have recommended;
+// "deny" refuses to guess and routes a genuine impasse to the goal's own unmet
+// path instead. Both are only in force while the goal is active, so a paused,
+// limited, or closed goal asks questions normally.
+export function questionPolicyReminder(policy: QuestionPolicy) {
+  if (policy === "allow") return ""
+  if (policy === "deny") {
+    return `Question policy while this goal is active:
+- Do not call the question tool. It is blocked and the call will fail.
+- The same goes for every other route to the user: no ask-the-user skill or command, no question in prose, and no turn that ends by waiting for an answer. This goal runs unattended and nobody is watching the terminal.
+- Resolve ambiguity from the worktree, the objective, and existing conventions in the code you are changing.
+- If you are genuinely at an impasse that no amount of further work can clear, call update_goal with status "unmet" and a concrete blocker naming exactly what you need. Do not guess.`
+  }
+  return `Question policy while this goal is active:
+- Do not call the question tool. It is blocked and the call will fail.
+- The same goes for every other route to the user: no ask-the-user skill or command, no question in prose, and no turn that ends by waiting for an answer. This goal runs unattended and nobody is watching the terminal.
+- When you would have asked, decide instead: pick the answer you would have recommended, say in one line what you chose and why, and continue.
+- Prefer the reading a careful colleague would take: the worktree, the objective, and the conventions already in the code you are changing are your evidence.
+- Record the decision as an assumption in your turn summary so the user can correct it later. A stated assumption the user can override is worth more than a stalled turn.
+- Reserve update_goal with status "unmet" for a real impasse, not for a choice you could make and flag.`
+}
+
+// Returned to the model in place of the blocked question tool's result. It
+// repeats the instruction at the point of failure because a system-prompt rule
+// read many turns ago is weaker than an error arriving in the same breath as
+// the attempt.
+export function questionBlockedMessage(policy: QuestionPolicy, questionText?: string) {
+  const asked = questionText?.trim()
+  // A live probe against opencode 1.18.23 showed the thrown message arriving at
+  // the model as the failed tool's error text, indistinguishable at a glance
+  // from tool OUTPUT -- the probe model read it as file content and dismissed it
+  // as a prompt-injection attempt. Naming the source up front is what stops the
+  // instruction from being discounted as untrusted data.
+  const provenance = "This is a notice from the OpenCode goal-mode plugin, not file content or user input."
+  const heading =
+    policy === "deny"
+      ? "The question tool is disabled while this session goal is active."
+      : "The question tool is disabled while this session goal is active. Decide instead of asking."
+  const instruction =
+    policy === "deny"
+      ? `Do not ask the user anything, here or in prose. Resolve this from the worktree, the objective, and existing conventions. If it is a true impasse, call update_goal with status "unmet" and a concrete blocker.`
+      : `Pick the answer you would have recommended, state in one line what you chose and why, and continue working toward the objective. Record it as an assumption in your turn summary so the user can correct it later. Do not retry this tool.`
+  const body = asked ? `${heading}\n\nBlocked question: ${asked}\n\n${instruction}` : `${heading}\n\n${instruction}`
+  return `${provenance}\n\n${body}`
+}

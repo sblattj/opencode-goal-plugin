@@ -34,6 +34,7 @@ type GoalSnapshot = {
   noProgressTokenThreshold: number | null
   maxNoProgressTurns: number | null
   noProgressTurns: number
+  questionsSuppressed?: number
   budgetWrapupSent: boolean
   stopReason: string | null
   history: GoalHistoryEntry[]
@@ -332,6 +333,9 @@ function isGoalSnapshot(value: unknown): value is GoalSnapshot {
   if (value.noProgressTokenThreshold !== null && typeof value.noProgressTokenThreshold !== "number") return false
   if (value.maxNoProgressTurns !== null && typeof value.maxNoProgressTurns !== "number") return false
   if (typeof value.noProgressTurns !== "number") return false
+  // Optional on purpose: a goal persisted before this field existed still
+  // renders in the sidebar instead of failing validation and blanking it.
+  if (value.questionsSuppressed != null && typeof value.questionsSuppressed !== "number") return false
   if (typeof value.budgetWrapupSent !== "boolean") return false
   if (value.stopReason !== null && typeof value.stopReason !== "string") return false
   if (!Array.isArray(value.history) || !value.history.every(isHistoryEntry)) return false
@@ -396,6 +400,7 @@ function formatGoal(goal: GoalSnapshot | null) {
   if (goal.remainingTokens != null) lines.push(`Tokens remaining: ${goal.remainingTokens}`)
   if (goal.maxDurationSeconds != null) lines.push(`Duration limit: ${formatDuration(goal.maxDurationSeconds)}`)
   if (goal.noProgressTurns > 0) lines.push(`No-progress turns: ${goal.noProgressTurns}`)
+  if ((goal.questionsSuppressed ?? 0) > 0) lines.push(`Questions suppressed: ${goal.questionsSuppressed}`)
   if (goal.lastCheckpoint) lines.push(`Latest checkpoint: ${goal.lastCheckpoint.summary}`)
   if (goal.stopReason) lines.push(`Stop reason: ${goal.stopReason}`)
   if (goal.lastStatus) lines.push(`Last status: ${goal.lastStatus}`)

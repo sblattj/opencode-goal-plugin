@@ -184,6 +184,7 @@ var GoalSchema = Schema.Struct({
   noProgressTokenThreshold: Schema.optionalWith(NullableNumber, { default: () => DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD }),
   maxNoProgressTurns: Schema.optionalWith(NullableNumber, { default: () => DEFAULT_MAX_NO_PROGRESS_TURNS }),
   noProgressTurns: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  questionsSuppressed: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   budgetWrapupSent: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   stopReason: Schema.optionalWith(NullableString, { default: () => null }),
   history: Schema.optionalWith(Schema.Array(HistoryEntrySchema), { default: () => [] }),
@@ -322,6 +323,7 @@ function normalizeGoal(goal) {
   goal.continuationBaselineMessageID ??= "";
   goal.continuationBaselineSummary ??= "";
   goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0);
+  goal.questionsSuppressed = nonNegativeInteger(goal.questionsSuppressed, 0);
   goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns);
   goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds);
   goal.tokenBudget = positiveIntegerOrNull(goal.tokenBudget);
@@ -433,6 +435,7 @@ function snapshot(goal) {
     noProgressTokenThreshold: goal.noProgressTokenThreshold,
     maxNoProgressTurns: goal.maxNoProgressTurns,
     noProgressTurns: goal.noProgressTurns,
+    questionsSuppressed: goal.questionsSuppressed,
     budgetWrapupSent: goal.budgetWrapupSent,
     stopReason: goal.stopReason,
     history: goal.history,
@@ -521,6 +524,7 @@ async function createGoal(sessionID, objective, options) {
       noProgressTokenThreshold: normalizedOptions.noProgressTokenThreshold,
       maxNoProgressTurns: normalizedOptions.maxNoProgressTurns,
       noProgressTurns: 0,
+      questionsSuppressed: 0,
       budgetWrapupSent: false,
       stopReason: paused ? PLAN_MODE_STOP_REASON : null,
       history: [],
@@ -584,6 +588,18 @@ async function recordPromptAgent(sessionID, agent) {
       return snapshot(goal);
     goal.lastPromptAgent = value;
     goal.updatedAt = nowSeconds();
+    return snapshot(goal);
+  });
+}
+async function recordSuppressedQuestion(sessionID, detail) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID];
+    if (!goal || goal.status !== "active")
+      return goal ? snapshot(goal) : null;
+    goal.questionsSuppressed = nonNegativeInteger(goal.questionsSuppressed, 0) + 1;
+    goal.updatedAt = nowSeconds();
+    const asked = summarizeText(detail ?? "", 200);
+    pushHistory(goal, "warning", asked ? `Question tool blocked by goal policy: ${asked}` : "Question tool blocked by goal policy.");
     return snapshot(goal);
   });
 }
@@ -1033,6 +1049,8 @@ function formatGoal(goal) {
     lines.push(`Duration limit: ${goal.maxDurationSeconds}s`);
   if (goal.noProgressTurns > 0)
     lines.push(`No-progress turns: ${goal.noProgressTurns}`);
+  if (goal.questionsSuppressed > 0)
+    lines.push(`Questions suppressed: ${goal.questionsSuppressed}`);
   if (goal.lastCheckpoint)
     lines.push(`Latest checkpoint: ${goal.lastCheckpoint.summary}`);
   if (goal.lastStatus)
@@ -1152,6 +1170,40 @@ ${escapeXmlText(formatGoal(goal))}
 
 Preserve the goal objective, status, elapsed time, budget usage, latest checkpoint, and any completion evidence or blocker in the compacted context. After compaction, continue from the next concrete unfinished step only if the goal remains active. Before closing the goal, audit real artifacts and command outputs; close with update_goal status "complete" only with evidence, or status "unmet" only with a concrete blocker.`;
 }
+function questionPolicyReminder(policy) {
+  if (policy === "allow")
+    return "";
+  if (policy === "deny") {
+    return `Question policy while this goal is active:
+- Do not call the question tool. It is blocked and the call will fail.
+- The same goes for every other route to the user: no ask-the-user skill or command, no question in prose, and no turn that ends by waiting for an answer. This goal runs unattended and nobody is watching the terminal.
+- Resolve ambiguity from the worktree, the objective, and existing conventions in the code you are changing.
+- If you are genuinely at an impasse that no amount of further work can clear, call update_goal with status "unmet" and a concrete blocker naming exactly what you need. Do not guess.`;
+  }
+  return `Question policy while this goal is active:
+- Do not call the question tool. It is blocked and the call will fail.
+- The same goes for every other route to the user: no ask-the-user skill or command, no question in prose, and no turn that ends by waiting for an answer. This goal runs unattended and nobody is watching the terminal.
+- When you would have asked, decide instead: pick the answer you would have recommended, say in one line what you chose and why, and continue.
+- Prefer the reading a careful colleague would take: the worktree, the objective, and the conventions already in the code you are changing are your evidence.
+- Record the decision as an assumption in your turn summary so the user can correct it later. A stated assumption the user can override is worth more than a stalled turn.
+- Reserve update_goal with status "unmet" for a real impasse, not for a choice you could make and flag.`;
+}
+function questionBlockedMessage(policy, questionText) {
+  const asked = questionText?.trim();
+  const provenance = "This is a notice from the OpenCode goal-mode plugin, not file content or user input.";
+  const heading = policy === "deny" ? "The question tool is disabled while this session goal is active." : "The question tool is disabled while this session goal is active. Decide instead of asking.";
+  const instruction = policy === "deny" ? `Do not ask the user anything, here or in prose. Resolve this from the worktree, the objective, and existing conventions. If it is a true impasse, call update_goal with status "unmet" and a concrete blocker.` : `Pick the answer you would have recommended, state in one line what you chose and why, and continue working toward the objective. Record it as an assumption in your turn summary so the user can correct it later. Do not retry this tool.`;
+  const body = asked ? `${heading}
+
+Blocked question: ${asked}
+
+${instruction}` : `${heading}
+
+${instruction}`;
+  return `${provenance}
+
+${body}`;
+}
 
 // src/server.ts
 var DEFAULT_MAX_AUTO_TURNS = 25;
@@ -1167,6 +1219,8 @@ var RETRY_SETTLE_MS = 25;
 var TRANSPORT_ERROR_PATTERN = /\b(?:network|fetch|socket|connect|connection|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|transport|stream|websocket|offline|internet|request failed|proxy)\b/i;
 var NON_TRANSPORT_TERMINAL_PATTERN = /\b(?:abort(?:ed)?|interrupt(?:ed|ion)?)\b/i;
 var NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals"]);
+var QUESTION_TOOL = "question";
+var DEFAULT_QUESTION_POLICY = "decide";
 var TASK_TERMINAL_STATES = new Set(["completed", "error", "cancelled"]);
 var PLAN_MODE_CREATE_NOTICE = 'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.';
 var LIMITED_GOAL_NOTICE = "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, remaining work, and blockers, then wait for the user to resume or edit the goal.";
@@ -1202,6 +1256,24 @@ Use the goal tools to handle this command:
 - Otherwise, call get_goal first. If it returns a non-closed goal with the same objective, do not create it again; continue working from the returned state. If it returns a different non-closed goal, report that conflict instead of replacing it. Only when there is no non-closed goal, call create_goal once. Use the full arguments as the objective. If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to create_goal rather than leaving those words in the objective.
 
 Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds or returns an existing matching goal, never call it again for this command; continue working from the returned goal state.`;
+}
+function questionPolicyFromOptions(options) {
+  const raw = typeof options?.question_policy === "string" ? options.question_policy.trim().toLowerCase() : "";
+  if (raw === "allow" || raw === "decide" || raw === "deny")
+    return raw;
+  return DEFAULT_QUESTION_POLICY;
+}
+function isQuestionTool(tool) {
+  return typeof tool === "string" && tool.trim().toLowerCase() === QUESTION_TOOL;
+}
+function questionTextFromArgs(args) {
+  if (!isRecord(args))
+    return "";
+  const questions = args.questions;
+  if (!Array.isArray(questions))
+    return "";
+  const texts = questions.map((entry) => isRecord(entry) && typeof entry.question === "string" ? entry.question.trim() : "").filter(Boolean);
+  return texts.join(" | ");
 }
 function commandNameFromOptions(options) {
   const name = options?.command_name?.trim() || DEFAULT_COMMAND_NAME;
@@ -1905,6 +1977,7 @@ var server = async ({ client }, options) => {
   const maxPromptFailures = positiveIntegerOrNull2(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options?.register_command ?? true;
   const commandName = commandNameFromOptions(options);
+  const questionPolicy = questionPolicyFromOptions(options);
   const taskTracker = new TaskTracker;
   const taskDeferredSessions = new Set;
   const scheduledContinuations = new Map;
@@ -1918,6 +1991,14 @@ var server = async ({ client }, options) => {
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const goalServices = { options: options ?? {}, isPlanAgent };
   let disposed = false;
+  async function questionsAreBlocked(sessionID) {
+    if (questionPolicy === "allow")
+      return false;
+    if (typeof sessionID !== "string" || !sessionID)
+      return false;
+    const goal = await getGoal(sessionID);
+    return goal?.status === "active";
+  }
   async function taskBlockStatus(sessionID) {
     if (!deferWhileTasksActive)
       return false;
@@ -2266,10 +2347,16 @@ var server = async ({ client }, options) => {
         }
       }
     },
-    async "tool.execute.before"(input) {
+    async "tool.execute.before"(input, output) {
       taskTracker.noteTaskCall(input);
       const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined;
       const callID = typeof input?.callID === "string" ? input.callID : undefined;
+      if (isQuestionTool(input?.tool) && await questionsAreBlocked(sessionID)) {
+        const asked = questionTextFromArgs(output?.args);
+        if (sessionID)
+          await recordSuppressedQuestion(sessionID, asked);
+        throw new Error(questionBlockedMessage(questionPolicy, asked));
+      }
       if (sessionID && callID) {
         const goal = await getGoalInternal(sessionID);
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
@@ -2328,6 +2415,8 @@ var server = async ({ client }, options) => {
       if (typeof input.sessionID !== "string")
         return;
       mergeSystemReminder(output, systemReminder());
+      if (await questionsAreBlocked(input.sessionID))
+        mergeSystemReminder(output, questionPolicyReminder(questionPolicy));
     },
     async "experimental.session.compacting"(input, output) {
       const goal = await getGoal(input.sessionID);
@@ -2456,6 +2545,7 @@ async function setupV2(context) {
   const maxPromptFailures = positiveIntegerOrNull2(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options.register_command ?? true;
   const commandName = commandNameFromOptions(options);
+  const questionPolicy = questionPolicyFromOptions(options);
   const taskTracker = new TaskTracker;
   const taskDeferredSessions = new Set;
   const scheduledContinuations = new Map;
@@ -2974,6 +3064,14 @@ async function setupV2(context) {
       });
     }));
   }
+  async function questionsAreBlocked(sessionID) {
+    if (questionPolicy === "allow")
+      return false;
+    if (typeof sessionID !== "string" || !sessionID)
+      return false;
+    const goal = await getGoal(sessionID);
+    return goal?.status === "active";
+  }
   registrations.push(await context.tool.transform((draft) => {
     for (const tool of goalToolsV2(goalServices))
       draft.add(tool);
@@ -2982,6 +3080,12 @@ async function setupV2(context) {
     taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id });
     const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined;
     const callID = typeof input.id === "string" ? input.id : undefined;
+    if (isQuestionTool(input.tool) && await questionsAreBlocked(sessionID)) {
+      const asked = questionTextFromArgs(input.input);
+      if (sessionID)
+        await recordSuppressedQuestion(sessionID, asked);
+      throw new Error(questionBlockedMessage(questionPolicy, asked));
+    }
     if (sessionID && callID) {
       const goal = await getGoalInternal(sessionID);
       toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
@@ -3017,11 +3121,19 @@ async function setupV2(context) {
       cancelScheduledContinuation(sessionID);
     }
   }));
-  registrations.push(await context.session.hook("context", (sessionContext) => {
+  registrations.push(await context.session.hook("context", async (sessionContext) => {
     const reminder = systemReminder();
-    if (sessionContext.system.some((part) => part.type === "text" && part.text.includes(reminder)))
+    if (!sessionContext.system.some((part) => part.type === "text" && part.text.includes(reminder))) {
+      sessionContext.system.push({ type: "text", text: reminder });
+    }
+    if (!await questionsAreBlocked(sessionContext.sessionID))
       return;
-    sessionContext.system.push({ type: "text", text: reminder });
+    const policy = questionPolicyReminder(questionPolicy);
+    if (policy && !sessionContext.system.some((part) => part.type === "text" && part.text.includes(policy))) {
+      sessionContext.system.push({ type: "text", text: policy });
+    }
+    if (sessionContext.tools)
+      delete sessionContext.tools[QUESTION_TOOL];
   }));
   const abortController = new AbortController;
   let eventIterator;

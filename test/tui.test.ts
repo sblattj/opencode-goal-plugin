@@ -303,3 +303,43 @@ test("clears the cached goal after clear_goal completes", () => {
 
   expect(goalStateFromSession(api as never, "clear-cache-session").goal).toBeNull()
 })
+
+function sessionApiForSnapshot(snapshot: unknown) {
+  return {
+    state: {
+      session: {
+        messages() {
+          return [{ id: "msg" }]
+        },
+      },
+      part() {
+        return [
+          {
+            type: "tool",
+            tool: "get_goal",
+            state: { status: "completed", output: JSON.stringify({ goal: snapshot }) },
+          },
+        ]
+      },
+    },
+  }
+}
+
+// The sidebar validates whatever is already persisted, so a goal written before
+// questionsSuppressed existed must still render. If the field were required the
+// panel would go blank on the first run after an upgrade.
+test("a goal snapshot written before questionsSuppressed existed still reads", () => {
+  const { questionsSuppressed: _dropped, ...legacy } = { ...goal({ objective: "legacy goal" }), questionsSuppressed: 0 }
+  expect("questionsSuppressed" in legacy).toBe(false)
+  const state = goalStateFromSession(sessionApiForSnapshot(legacy) as never, "legacy-session")
+  expect(state.goal?.objective).toBe("legacy goal")
+  expect(state.goal?.questionsSuppressed).toBeUndefined()
+})
+
+test("the sidebar accepts a numeric suppressed-question count and rejects a non-numeric one", () => {
+  const withCount = { ...goal({ objective: "counted goal" }), questionsSuppressed: 3 }
+  expect(goalStateFromSession(sessionApiForSnapshot(withCount) as never, "counted-session").goal?.questionsSuppressed).toBe(3)
+
+  const corrupt = { ...goal({ objective: "corrupt goal" }), questionsSuppressed: "three" }
+  expect(goalStateFromSession(sessionApiForSnapshot(corrupt) as never, "corrupt-session").goal).toBeNull()
+})

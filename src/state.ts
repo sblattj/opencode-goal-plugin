@@ -100,6 +100,7 @@ export type Goal = {
   noProgressTokenThreshold: number | null
   maxNoProgressTurns: number | null
   noProgressTurns: number
+  questionsSuppressed: number
   budgetWrapupSent: boolean
   stopReason: string | null
   history: GoalHistoryEntry[]
@@ -210,6 +211,7 @@ const GoalSchema = Schema.Struct({
   noProgressTokenThreshold: Schema.optionalWith(NullableNumber, { default: () => DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD }),
   maxNoProgressTurns: Schema.optionalWith(NullableNumber, { default: () => DEFAULT_MAX_NO_PROGRESS_TURNS }),
   noProgressTurns: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  questionsSuppressed: Schema.optionalWith(Schema.Number, { default: () => 0 }),
   budgetWrapupSent: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   stopReason: Schema.optionalWith(NullableString, { default: () => null }),
   history: Schema.optionalWith(Schema.Array(HistoryEntrySchema), { default: () => [] }),
@@ -436,6 +438,7 @@ function normalizeGoal(goal: Goal) {
   goal.continuationBaselineMessageID ??= ""
   goal.continuationBaselineSummary ??= ""
   goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0)
+  goal.questionsSuppressed = nonNegativeInteger(goal.questionsSuppressed, 0)
   goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns)
   goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds)
   goal.tokenBudget = positiveIntegerOrNull(goal.tokenBudget)
@@ -562,6 +565,7 @@ export function snapshot(goal: Goal): GoalSnapshot {
     noProgressTokenThreshold: goal.noProgressTokenThreshold,
     maxNoProgressTurns: goal.maxNoProgressTurns,
     noProgressTurns: goal.noProgressTurns,
+    questionsSuppressed: goal.questionsSuppressed,
     budgetWrapupSent: goal.budgetWrapupSent,
     stopReason: goal.stopReason,
     history: goal.history,
@@ -665,6 +669,7 @@ export async function createGoal(sessionID: string, objective: string, options?:
       noProgressTokenThreshold: normalizedOptions.noProgressTokenThreshold,
       maxNoProgressTurns: normalizedOptions.maxNoProgressTurns,
       noProgressTurns: 0,
+      questionsSuppressed: 0,
       budgetWrapupSent: false,
       stopReason: paused ? PLAN_MODE_STOP_REASON : null,
       history: [],
@@ -732,6 +737,28 @@ export async function recordPromptAgent(sessionID: string, agent: string) {
     if (goal.lastPromptAgent === value) return snapshot(goal)
     goal.lastPromptAgent = value
     goal.updatedAt = nowSeconds()
+    return snapshot(goal)
+  })
+}
+
+// Records that a question tool call was blocked while this goal was active.
+// The counter rides along in the snapshot so the model sees its own blocked
+// attempts accumulating, and the history entry gives the user an audit trail of
+// what the agent wanted to ask before it decided for itself. Recorded under the
+// existing "warning" history type on purpose: adding a new literal to the
+// history union would make a newer state file undecodable by an older plugin.
+// readStateEffect only falls back to an empty state on ENOENT and re-raises a
+// StateDecodeError, so the goals on disk survive -- but every read fails, which
+// means a downgraded plugin can no longer see any goal in the file. Reusing an
+// existing literal costs nothing and avoids the whole class.
+export async function recordSuppressedQuestion(sessionID: string, detail?: string | null) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || goal.status !== "active") return goal ? snapshot(goal) : null
+    goal.questionsSuppressed = nonNegativeInteger(goal.questionsSuppressed, 0) + 1
+    goal.updatedAt = nowSeconds()
+    const asked = summarizeText(detail ?? "", 200)
+    pushHistory(goal, "warning", asked ? `Question tool blocked by goal policy: ${asked}` : "Question tool blocked by goal policy.")
     return snapshot(goal)
   })
 }
@@ -1264,6 +1291,7 @@ export function formatGoal(goal: GoalSnapshot | null) {
   if (goal.remainingTokens != null) lines.push(`Tokens remaining: ${goal.remainingTokens}`)
   if (goal.maxDurationSeconds != null) lines.push(`Duration limit: ${goal.maxDurationSeconds}s`)
   if (goal.noProgressTurns > 0) lines.push(`No-progress turns: ${goal.noProgressTurns}`)
+  if (goal.questionsSuppressed > 0) lines.push(`Questions suppressed: ${goal.questionsSuppressed}`)
   if (goal.lastCheckpoint) lines.push(`Latest checkpoint: ${goal.lastCheckpoint.summary}`)
   if (goal.lastStatus) lines.push(`Last status: ${goal.lastStatus}`)
   if (goal.stopReason) lines.push(`Stop reason: ${goal.stopReason}`)

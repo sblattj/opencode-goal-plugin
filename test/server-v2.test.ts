@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
+import { questionBlockedMessage, questionPolicyReminder } from "../src/prompts"
 import { getGoal, getGoalInternal, recordContinuationResult, reserveContinuation } from "../src/state"
 
 const TOOL_NAMES = [
@@ -1041,6 +1042,440 @@ test("V2 completed tool failures do not clear retry state", async () => {
     expect(goal?.continuationFailures).toBe(1)
     expect(goal?.pendingAttempt?.id).toBe(attemptID)
   }
+
+  mock.stream.end()
+  await cleanup()
+})
+
+// ---------------------------------------------------------------------------
+// question_policy. OpenCode's built-in `question` tool blocks the turn until a
+// human answers, which stalls an unattended goal forever. While a goal is
+// ACTIVE and the policy is not "allow", V2 both drops the tool from the set the
+// model is offered (the context hook) and fails the call if it arrives anyway
+// (execute.before). Any other goal status, or no goal, is untouched.
+// ---------------------------------------------------------------------------
+
+const QUESTION_POLICY_HEADING = "Question policy while this goal is active:"
+const GOAL_REMINDER_HEADING = "OpenCode goal mode policy:"
+
+type SessionContextLike = {
+  sessionID: string
+  agent: string
+  system: Array<{ type: string; text: string }>
+  messages: unknown[]
+  tools?: Record<string, unknown>
+}
+
+function seededTools(): Record<string, unknown> {
+  return {
+    question: { description: "ask the user a question" },
+    read: { description: "read a file" },
+    edit: { description: "edit a file" },
+    bash: { description: "run a command" },
+  }
+}
+
+function sessionContextWithTools(tools?: Record<string, unknown>, sessionID = "ses_v2"): SessionContextLike {
+  const sessionContext: SessionContextLike = { sessionID, agent: "build", system: [], messages: [] }
+  if (tools !== undefined) sessionContext.tools = tools
+  return sessionContext
+}
+
+function partsContaining(sessionContext: SessionContextLike, needle: string) {
+  return sessionContext.system.filter((part) => part.type === "text" && part.text.includes(needle))
+}
+
+async function runContextHook(mock: MockContext, sessionContext: SessionContextLike) {
+  const contextHook = mock.hooks["context"]
+  expect(contextHook).toBeTypeOf("function")
+  await contextHook!(sessionContext)
+}
+
+// Returns the thrown message, or null when the hook let the call through.
+async function blockMessageFor(mock: MockContext, input: Record<string, unknown>) {
+  try {
+    await mock.hooks["execute.before"]!(input)
+  } catch (error) {
+    return (error as Error).message
+  }
+  return null
+}
+
+async function questionsSuppressedCount(mock: MockContext, sessionID = "ses_v2") {
+  const read = contentOf(await goalTool(mock, "get_goal").execute({}, toolContext(sessionID)))
+  const match = /"questionsSuppressed":\s*(\d+)/.exec(read)
+  return match ? Number(match[1]) : null
+}
+
+test("V2 context hook removes only the question tool from the offered tool set", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "run unattended without stopping to ask")
+
+  const sessionContext = sessionContextWithTools(seededTools())
+  await runContextHook(mock, sessionContext)
+
+  expect(sessionContext.tools).toBeDefined()
+  expect("question" in sessionContext.tools!).toBe(false)
+  expect(sessionContext.tools!.question).toBeUndefined()
+  expect(Object.keys(sessionContext.tools!).sort()).toEqual(["bash", "edit", "read"])
+  expect(sessionContext.tools!.read).toEqual({ description: "read a file" })
+  expect(sessionContext.tools!.edit).toEqual({ description: "edit a file" })
+  expect(sessionContext.tools!.bash).toEqual({ description: "run a command" })
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 context hook pushes the question-policy reminder beside the goal reminder exactly once", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "keep the loop moving without a human")
+
+  const sessionContext = sessionContextWithTools(seededTools())
+  await runContextHook(mock, sessionContext)
+
+  expect(sessionContext.system).toHaveLength(2)
+  expect(partsContaining(sessionContext, GOAL_REMINDER_HEADING)).toHaveLength(1)
+  const policyParts = partsContaining(sessionContext, QUESTION_POLICY_HEADING)
+  expect(policyParts).toHaveLength(1)
+  expect(policyParts[0]!.type).toBe("text")
+  expect(policyParts[0]!.text).toBe(questionPolicyReminder("decide"))
+  expect(policyParts[0]!.text).toContain("When you would have asked, decide instead")
+
+  // A second invocation on the same context adds neither part again.
+  await runContextHook(mock, sessionContext)
+  expect(sessionContext.system).toHaveLength(2)
+  expect(partsContaining(sessionContext, GOAL_REMINDER_HEADING)).toHaveLength(1)
+  expect(partsContaining(sessionContext, QUESTION_POLICY_HEADING)).toHaveLength(1)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test('V2 context hook reminder text follows question_policy "deny"', async () => {
+  const mock = makeMockContext({ auto_continue: false, question_policy: "deny" })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "refuse to guess at an impasse")
+
+  const sessionContext = sessionContextWithTools(seededTools())
+  await runContextHook(mock, sessionContext)
+
+  const policyParts = partsContaining(sessionContext, QUESTION_POLICY_HEADING)
+  expect(policyParts).toHaveLength(1)
+  expect(policyParts[0]!.text).toBe(questionPolicyReminder("deny"))
+  expect(policyParts[0]!.text).toContain('call update_goal with status "unmet"')
+  expect(policyParts[0]!.text).not.toContain("When you would have asked, decide instead")
+  expect(sessionContext.tools!.question).toBeUndefined()
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test('V2 context hook leaves the question tool in place under question_policy "allow"', async () => {
+  const mock = makeMockContext({ auto_continue: false, question_policy: "allow" })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "keep asking the user, on purpose")
+
+  const sessionContext = sessionContextWithTools(seededTools())
+  await runContextHook(mock, sessionContext)
+
+  expect(sessionContext.tools!.question).toEqual({ description: "ask the user a question" })
+  expect(Object.keys(sessionContext.tools!).sort()).toEqual(["bash", "edit", "question", "read"])
+  expect(partsContaining(sessionContext, QUESTION_POLICY_HEADING)).toHaveLength(0)
+  expect(sessionContext.system).toHaveLength(1)
+  expect(partsContaining(sessionContext, GOAL_REMINDER_HEADING)).toHaveLength(1)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 context hook leaves the question tool alone unless the goal is active", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+
+  // No goal at all: the goal reminder still lands, the question tool survives.
+  const noGoal = sessionContextWithTools(seededTools())
+  await runContextHook(mock, noGoal)
+  expect(noGoal.tools!.question).toEqual({ description: "ask the user a question" })
+  expect(partsContaining(noGoal, GOAL_REMINDER_HEADING)).toHaveLength(1)
+  expect(partsContaining(noGoal, QUESTION_POLICY_HEADING)).toHaveLength(0)
+
+  await createGoalViaV2Tool(mock, "pause and resume around the question gate")
+  await goalTool(mock, "update_goal_status").execute({ status: "paused" }, toolContext())
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+
+  const paused = sessionContextWithTools(seededTools())
+  await runContextHook(mock, paused)
+  expect(paused.tools!.question).toEqual({ description: "ask the user a question" })
+  expect(Object.keys(paused.tools!).sort()).toEqual(["bash", "edit", "question", "read"])
+  expect(partsContaining(paused, QUESTION_POLICY_HEADING)).toHaveLength(0)
+
+  // Resuming closes the gate again, so the gate really tracks status.
+  await goalTool(mock, "update_goal_status").execute({ status: "active" }, toolContext())
+  expect((await getGoal("ses_v2"))?.status).toBe("active")
+  const resumed = sessionContextWithTools(seededTools())
+  await runContextHook(mock, resumed)
+  expect(resumed.tools!.question).toBeUndefined()
+  expect(partsContaining(resumed, QUESTION_POLICY_HEADING)).toHaveLength(1)
+
+  // A closed goal reopens the gate.
+  await goalTool(mock, "update_goal").execute({ status: "complete", evidence: "shipped" }, toolContext())
+  expect((await getGoal("ses_v2"))?.status).toBe("complete")
+  const closed = sessionContextWithTools(seededTools())
+  await runContextHook(mock, closed)
+  expect(closed.tools!.question).toEqual({ description: "ask the user a question" })
+  expect(partsContaining(closed, QUESTION_POLICY_HEADING)).toHaveLength(0)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 context hook survives a session context with no tools map", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "tolerate a runtime shape we do not own")
+
+  const missing = sessionContextWithTools(undefined)
+  expect("tools" in missing).toBe(false)
+  await runContextHook(mock, missing)
+  expect(missing.tools).toBeUndefined()
+  expect(partsContaining(missing, QUESTION_POLICY_HEADING)).toHaveLength(1)
+  expect(partsContaining(missing, GOAL_REMINDER_HEADING)).toHaveLength(1)
+
+  const explicitUndefined = sessionContextWithTools(undefined)
+  explicitUndefined.tools = undefined
+  expect("tools" in explicitUndefined).toBe(true)
+  await runContextHook(mock, explicitUndefined)
+  expect(explicitUndefined.tools).toBeUndefined()
+  expect(partsContaining(explicitUndefined, QUESTION_POLICY_HEADING)).toHaveLength(1)
+
+  const emptyTools = sessionContextWithTools({})
+  await runContextHook(mock, emptyTools)
+  expect(emptyTools.tools).toEqual({})
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 execute.before blocks the question tool with decide wording by default", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "decide instead of asking")
+
+  const message = await blockMessageFor(mock, {
+    tool: "question",
+    sessionID: "ses_v2",
+    id: "call_q1",
+    input: { questions: [{ question: "Should I use tabs or spaces?" }] },
+  })
+
+  expect(message).toBeTypeOf("string")
+  expect(message).toContain("The question tool is disabled while this session goal is active. Decide instead of asking.")
+  expect(message).toContain("Pick the answer you would have recommended")
+  expect(message).not.toContain('call update_goal with status "unmet" and a concrete blocker.')
+  expect(message).toBe(questionBlockedMessage("decide", "Should I use tabs or spaces?"))
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test('V2 execute.before blocks the question tool with deny wording under question_policy "deny"', async () => {
+  const mock = makeMockContext({ auto_continue: false, question_policy: "deny" })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "route an impasse to unmet")
+
+  const message = await blockMessageFor(mock, {
+    tool: "question",
+    sessionID: "ses_v2",
+    id: "call_q1",
+    input: { questions: [{ question: "Should I use tabs or spaces?" }] },
+  })
+
+  expect(message).toBeTypeOf("string")
+  expect(message).toContain("The question tool is disabled while this session goal is active.")
+  expect(message).not.toContain("Decide instead of asking")
+  expect(message).not.toContain("Pick the answer you would have recommended")
+  expect(message).toContain('call update_goal with status "unmet" and a concrete blocker.')
+  expect(message).toBe(questionBlockedMessage("deny", "Should I use tabs or spaces?"))
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 an unrecognised question_policy falls back to decide rather than allowing questions", async () => {
+  const mock = makeMockContext({ auto_continue: false, question_policy: "sometimes-maybe" })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "survive a typo in the config file")
+
+  const sessionContext = sessionContextWithTools(seededTools())
+  await runContextHook(mock, sessionContext)
+  expect(sessionContext.tools!.question).toBeUndefined()
+  expect(partsContaining(sessionContext, QUESTION_POLICY_HEADING)[0]!.text).toBe(questionPolicyReminder("decide"))
+
+  const message = await blockMessageFor(mock, {
+    tool: "question",
+    sessionID: "ses_v2",
+    id: "call_q1",
+    input: { questions: [{ question: "Tabs or spaces?" }] },
+  })
+  expect(message).toBe(questionBlockedMessage("decide", "Tabs or spaces?"))
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 execute.before reads the asked question from input.input, not the V1 input.args", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "quote back what the model wanted to ask")
+
+  const asked = "Should the retry budget be 3 or 5?"
+  const fromInput = await blockMessageFor(mock, {
+    tool: "question",
+    sessionID: "ses_v2",
+    id: "call_q1",
+    input: { questions: [{ question: asked }] },
+  })
+  expect(fromInput).toContain(`Blocked question: ${asked}`)
+
+  // Several questions in one call are joined rather than dropped.
+  const joined = await blockMessageFor(mock, {
+    tool: "question",
+    sessionID: "ses_v2",
+    id: "call_q2",
+    input: { questions: [{ question: "First?" }, { question: "Second?" }] },
+  })
+  expect(joined).toContain("Blocked question: First? | Second?")
+
+  // The V1 shape carries no text on the V2 path: still blocked, nothing quoted.
+  const v1Shape = await blockMessageFor(mock, {
+    tool: "question",
+    sessionID: "ses_v2",
+    id: "call_q3",
+    args: { questions: [{ question: "V1 shaped question" }] },
+  })
+  expect(v1Shape).toBeTypeOf("string")
+  expect(v1Shape).not.toContain("Blocked question:")
+  expect(v1Shape).not.toContain("V1 shaped question")
+  expect(v1Shape).toBe(questionBlockedMessage("decide"))
+
+  // A malformed payload degrades to no text instead of throwing a TypeError.
+  const malformed = await blockMessageFor(mock, {
+    tool: "question",
+    sessionID: "ses_v2",
+    id: "call_q4",
+    input: { questions: "not an array" },
+  })
+  expect(malformed).toBe(questionBlockedMessage("decide"))
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 execute.before lets calls through whenever the question gate is open", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+
+  // No goal yet: even the question tool passes.
+  expect(
+    await blockMessageFor(mock, {
+      tool: "question",
+      sessionID: "ses_v2",
+      id: "call_no_goal",
+      input: { questions: [{ question: "Anyone home?" }] },
+    }),
+  ).toBeNull()
+
+  await createGoalViaV2Tool(mock, "block only the question tool")
+
+  // A different tool is never blocked, even with an active goal.
+  expect(
+    await blockMessageFor(mock, {
+      tool: "bash",
+      sessionID: "ses_v2",
+      id: "call_bash",
+      input: { command: "ls" },
+    }),
+  ).toBeNull()
+
+  // The tool id is matched case-insensitively.
+  expect(
+    await blockMessageFor(mock, {
+      tool: "Question",
+      sessionID: "ses_v2",
+      id: "call_caps",
+      input: { questions: [{ question: "Case sensitive?" }] },
+    }),
+  ).toBeTypeOf("string")
+
+  // A paused goal reopens the gate and does not move the counter.
+  await goalTool(mock, "update_goal_status").execute({ status: "paused" }, toolContext())
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+  expect(
+    await blockMessageFor(mock, {
+      tool: "question",
+      sessionID: "ses_v2",
+      id: "call_paused",
+      input: { questions: [{ question: "May I ask now?" }] },
+    }),
+  ).toBeNull()
+  expect(await questionsSuppressedCount(mock)).toBe(1)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test('V2 execute.before never blocks under question_policy "allow"', async () => {
+  const mock = makeMockContext({ auto_continue: false, question_policy: "allow" })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "let the old behaviour stand")
+
+  expect(
+    await blockMessageFor(mock, {
+      tool: "question",
+      sessionID: "ses_v2",
+      id: "call_q1",
+      input: { questions: [{ question: "Tabs or spaces?" }] },
+    }),
+  ).toBeNull()
+  expect(await questionsSuppressedCount(mock)).toBe(0)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 blocking a question increments the goal's questionsSuppressed counter", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "count what the model wanted to ask")
+
+  expect(contentOf(await goalTool(mock, "get_goal").execute({}, toolContext()))).toContain('"questionsSuppressed": 0')
+
+  await blockMessageFor(mock, {
+    tool: "question",
+    sessionID: "ses_v2",
+    id: "call_q1",
+    input: { questions: [{ question: "Ship it now?" }] },
+  })
+  expect(contentOf(await goalTool(mock, "get_goal").execute({}, toolContext()))).toContain('"questionsSuppressed": 1')
+
+  await blockMessageFor(mock, {
+    tool: "question",
+    sessionID: "ses_v2",
+    id: "call_q2",
+    input: { questions: [{ question: "Really ship it?" }] },
+  })
+  expect(contentOf(await goalTool(mock, "get_goal").execute({}, toolContext()))).toContain('"questionsSuppressed": 2')
+
+  // A tool that was never blocked leaves the counter where it was.
+  await blockMessageFor(mock, { tool: "bash", sessionID: "ses_v2", id: "call_bash", input: { command: "ls" } })
+  expect(await questionsSuppressedCount(mock)).toBe(2)
+
+  // The history keeps an audit trail of what it wanted to ask.
+  const history = contentOf(await goalTool(mock, "get_goal_history").execute({}, toolContext()))
+  expect(history).toContain("Question tool blocked by goal policy: Ship it now?")
+  expect(history).toContain("Question tool blocked by goal policy: Really ship it?")
 
   mock.stream.end()
   await cleanup()

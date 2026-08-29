@@ -29,6 +29,7 @@ The OpenCode Goal Plugin adds:
 - Goal close evidence: `complete` requires verified evidence, and `unmet` requires a concrete blocker.
 - Persistent per-session goal state with history, checkpoints, budgets, and owner-only file permissions.
 - Optional automatic continuation on `session.idle` / `session.status`, with no-progress pause and budget wrap-up safeguards.
+- Unattended-question handling: while a goal is active, OpenCode's built-in `question` tool is suppressed so the agent decides and records an assumption instead of stalling on a human.
 - Plan-mode safety: goals created from the `plan` agent stay paused, and auto-continue never escapes a Plan-mode session or switches agents on its own.
 - Compaction context so active goals are preserved when OpenCode summarizes a long session.
 
@@ -268,7 +269,8 @@ In OpenCode 1, server options use the package-and-options tuple in `opencode.jso
         "no_progress_token_threshold": 50,
         "max_no_progress_turns": 2,
         "restricted_agents": ["plan"],
-        "allow_goal_execution_from_plan": false
+        "allow_goal_execution_from_plan": false,
+        "question_policy": "decide"
       }
     ]
   ]
@@ -309,6 +311,7 @@ Defaults:
 - `command_name`: `"goal"`
 - `restricted_agents`: `["plan"]`; agents (matched case-insensitively) treated as planning-only for goal execution.
 - `allow_goal_execution_from_plan`: `false`; when `true`, disables Plan-mode goal restrictions entirely.
+- `question_policy`: `"decide"`; what happens to OpenCode's built-in `question` tool while a goal's status is `active`. `"decide"` blocks the tool and tells the model to pick the answer it would have recommended, say in one line what it chose, and record it as an assumption. `"deny"` blocks the tool and tells the model not to guess: resolve it from the worktree and the objective, or close the goal as `unmet` with a concrete blocker. `"allow"` blocks nothing and adds no policy text. An absent or unrecognized value falls back to `"decide"`. See [Questions while a goal is active](#questions-while-a-goal-is-active).
 
 ## Goal Workflow
 
@@ -336,6 +339,37 @@ The plugin also uses safety states while keeping the goal available for review o
 - `paused` when the user pauses, auto-continue repeatedly fails, or repeated low-progress goal continuation turns are detected. No-progress accounting is scoped to goal continuation turns: each reserved continuation is evaluated once, when its turn completes, and unrelated assistant activity in the session never pauses the goal.
 
 When a safety limit is reached, the plugin sends one wrap-up prompt asking for a concise handoff instead of silently continuing forever.
+
+## Questions While A Goal Is Active
+
+OpenCode ships a built-in `question` tool: the model calls it to ask you something mid-turn, and the turn blocks until a human answers. A goal is built to run unattended across many auto-continued turns, so one question call parks the whole goal until somebody happens to look at the terminal. While a goal's status is `active`, the plugin suppresses that tool and tells the model what to do instead. `question_policy` chooses which instruction it gets:
+
+- `"decide"` (the default) — the model picks the answer it would have recommended, says in one line what it chose and why, records it as an assumption in its turn summary, and keeps working. An assumption you can correct afterwards is worth more than a stalled goal.
+- `"deny"` — the model is told not to guess. It resolves the ambiguity from the worktree and the objective, and if it is genuinely at an impasse it closes the goal with `update_goal` status `"unmet"` and a concrete blocker.
+- `"allow"` — the pre-existing behavior: nothing is blocked and no policy text is added.
+
+`opencode.json`:
+
+```json
+{
+  "plugin": [
+    [
+      "./node_modules/@sblattj/opencode-goal-plugin/dist/server.js",
+      {
+        "question_policy": "deny"
+      }
+    ]
+  ]
+}
+```
+
+The policy only applies to an `active` goal. A paused, budget-limited, usage-limited, complete, or unmet goal — and any session with no goal at all — asks questions exactly as it did before, because those are the states where you are back in the loop.
+
+Enforcement is layered. The policy text is appended to the goal-mode system reminder, and that is the only part that tells the model what to do *instead* of asking. On OpenCode 2 the `question` tool is then dropped from the tool set offered to the session, so the model never sees it. OpenCode 1 cannot hide a tool per session, so the call is blocked instead: the plugin throws from the `tool.execute.before` hook, and the thrown text — carrying the same instruction — is what comes back to the model as the failed tool's error.
+
+If you never want questions at all, goal or no goal, you do not need this plugin for it. OpenCode's own config takes `"permission": {"question": "deny"}` (or the equivalent `"tools": {"question": false}`), globally or per agent. That is the blunter instrument: it is unconditional, and it answers the model with a bare `Permission denied: question` rather than telling it what to do instead. `question_policy` exists for the case where you want questions back the moment the goal is paused.
+
+Every block is recorded. It increments a `questionsSuppressed` counter on the goal and writes a history entry naming the blocked question, so `get_goal` and `get_goal_history` show what the agent wanted to ask before it decided for itself, and the goal snapshot carried through compaction reports `Questions suppressed: N`.
 
 ## Plan Mode Safety
 

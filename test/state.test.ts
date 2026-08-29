@@ -3,10 +3,12 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
+  type Goal,
   accountUsage,
   clearGoal,
   completeGoal,
   createGoal,
+  formatGoal,
   getAllGoals,
   markPendingContinuationStarted,
   recordAssistantProgress,
@@ -21,6 +23,8 @@ import {
   reserveContinuation,
   rollbackContinuationAttempt,
   setGoalStatus,
+  recordSuppressedQuestion,
+  snapshot,
   updateGoalObjective,
 } from "../src/state"
 
@@ -844,4 +848,274 @@ test("delayed prior-turn assistant output cannot clear a newer pending attempt",
     completedAt: reservedAt + 10_000,
   })
   expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
+})
+
+// ---------------------------------------------------------------------------
+// Suppressed-question accounting (questionsSuppressed / recordSuppressedQuestion)
+// ---------------------------------------------------------------------------
+
+/** The raw persisted Goal record, i.e. what normalizeGoal sees before snapshot(). */
+async function persistedGoal(sessionID: string) {
+  const state = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    goals: Record<string, Goal>
+  }
+  return state.goals[sessionID]!
+}
+
+/** A state file in the shape an older plugin wrote it: no questionsSuppressed key at all. */
+function legacyStateFile(goal: Record<string, unknown>) {
+  return JSON.stringify({
+    version: 1,
+    goals: {
+      ses_1: {
+        sessionID: "ses_1",
+        objective: "finish the migration",
+        status: "active",
+        tokenBudget: 5000,
+        tokensUsed: 120,
+        timeUsedSeconds: 30,
+        createdAt: 1,
+        updatedAt: 2,
+        lastAccountedAt: 1,
+        autoTurns: 3,
+        lastContinuationAt: null,
+        ...goal,
+      },
+    },
+  })
+}
+
+test("a fresh goal has no suppressed questions and formatGoal omits the line", async () => {
+  const created = await createGoal("ses_1", "ship the plugin", null)
+
+  expect(created.questionsSuppressed).toBe(0)
+  expect(formatGoal(created)).not.toContain("Questions suppressed")
+  expect((await getGoal("ses_1"))?.questionsSuppressed).toBe(0)
+})
+
+test("recordSuppressedQuestion increments the counter once per call and bumps updatedAt", async () => {
+  try {
+    setSystemTime(new Date(1_000_000))
+    await createGoal("ses_1", "ship the plugin", null)
+    const created = await getGoal("ses_1")
+    expect(created?.updatedAt).toBe(1000)
+
+    setSystemTime(new Date(2_000_000))
+    expect((await recordSuppressedQuestion("ses_1", "which database?"))?.questionsSuppressed).toBe(1)
+    expect((await recordSuppressedQuestion("ses_1", "which cache?"))?.questionsSuppressed).toBe(2)
+    const third = await recordSuppressedQuestion("ses_1", "which queue?")
+
+    expect(third?.questionsSuppressed).toBe(3)
+    expect(third?.updatedAt).toBe(2000)
+    expect((await getGoal("ses_1"))?.questionsSuppressed).toBe(3)
+  } finally {
+    setSystemTime()
+  }
+})
+
+// The history type is asserted explicitly because reusing the EXISTING "warning"
+// literal is a deliberate compatibility decision, not an accident of naming.
+test("a blocked question lands as a warning history entry naming the question", async () => {
+  await createGoal("ses_1", "ship the plugin", null)
+  const before = (await getGoal("ses_1"))!.history.length
+
+  const recorded = await recordSuppressedQuestion("ses_1", "Should I use Postgres or SQLite?")
+
+  expect(recorded?.history).toHaveLength(before + 1)
+  const entry = recorded!.history.at(-1)!
+  expect(entry.type).toBe("warning")
+  expect(entry.detail).toBe("Question tool blocked by goal policy: Should I use Postgres or SQLite?")
+  expect(entry.timestamp).toBeGreaterThan(0)
+  expect((await getGoal("ses_1"))?.history.at(-1)).toEqual(entry)
+})
+
+test("a blocked question with no text still records an entry with the no-question wording", async () => {
+  for (const [index, detail] of [undefined, "", null, "   \n\t "].entries()) {
+    const sessionID = `ses_blank_${index}`
+    await createGoal(sessionID, "ship the plugin", null)
+
+    const recorded = await recordSuppressedQuestion(sessionID, detail)
+
+    expect(recorded?.questionsSuppressed).toBe(1)
+    const entry = recorded!.history.at(-1)!
+    expect(entry.type).toBe("warning")
+    expect(entry.detail).toBe("Question tool blocked by goal policy.")
+  }
+})
+
+// The question runs through summarizeText(detail, 200) BEFORE it is embedded in
+// the message, so the 200-char cap is the question's, not pushHistory's 400.
+test("a long question is truncated at 200 characters and internal whitespace is collapsed", async () => {
+  await createGoal("ses_long", "ship the plugin", null)
+  const recorded = await recordSuppressedQuestion("ses_long", "a".repeat(300))
+
+  const truncated = recorded!.history.at(-1)!.detail
+  expect(truncated).toBe(`Question tool blocked by goal policy: ${"a".repeat(199)}...`)
+  expect(truncated.endsWith("...")).toBe(true)
+  expect(truncated).not.toContain("a".repeat(200))
+
+  await createGoal("ses_ws", "ship the plugin", null)
+  const collapsed = await recordSuppressedQuestion("ses_ws", "  Should I\n\nuse   Option A\tor Option B?  ")
+
+  expect(collapsed!.history.at(-1)!.detail).toBe("Question tool blocked by goal policy: Should I use Option A or Option B?")
+})
+
+test("recording a blocked question is a no-op for a paused goal", async () => {
+  await createGoal("ses_1", "ship the plugin", null)
+  await recordSuppressedQuestion("ses_1", "asked while active")
+  await setGoalStatus("ses_1", "paused")
+  const paused = (await getGoal("ses_1"))!
+
+  const result = await recordSuppressedQuestion("ses_1", "asked while paused")
+
+  expect(result?.status).toBe("paused")
+  expect(result?.questionsSuppressed).toBe(1)
+  expect(result?.history).toHaveLength(paused.history.length)
+  expect(result!.history.filter((entry) => entry.detail.includes("asked while paused"))).toHaveLength(0)
+  expect((await getGoal("ses_1"))?.questionsSuppressed).toBe(1)
+})
+
+test("recording a blocked question is a no-op for a completed or unmet goal", async () => {
+  await createGoal("ses_done", "ship the plugin", null)
+  await recordSuppressedQuestion("ses_done", "asked while active")
+  const completed = await completeGoal("ses_done", "tests passed")
+
+  const afterComplete = await recordSuppressedQuestion("ses_done", "asked after completion")
+  expect(afterComplete?.status).toBe("complete")
+  expect(afterComplete?.questionsSuppressed).toBe(1)
+  expect(afterComplete?.history).toHaveLength(completed.history.length)
+
+  await createGoal("ses_unmet", "ship the plugin", null)
+  await recordSuppressedQuestion("ses_unmet", "asked while active")
+  const unmet = await markGoalUnmet("ses_unmet", "missing external credentials")
+
+  const afterUnmet = await recordSuppressedQuestion("ses_unmet", "asked after the goal was abandoned")
+  expect(afterUnmet?.status).toBe("unmet")
+  expect(afterUnmet?.questionsSuppressed).toBe(1)
+  expect(afterUnmet?.history).toHaveLength(unmet.history.length)
+})
+
+test("recordSuppressedQuestion returns null for a session with no goal and creates none", async () => {
+  expect(await recordSuppressedQuestion("ses_missing", "anything at all")).toBeNull()
+
+  expect(await getGoal("ses_missing")).toBeNull()
+  const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    goals: Record<string, unknown>
+  }
+  expect(persisted.goals).not.toHaveProperty("ses_missing")
+  expect(Object.keys(persisted.goals)).toHaveLength(0)
+})
+
+test("the suppressed-question counter survives a write/read round trip", async () => {
+  await createGoal("ses_1", "ship the plugin", null)
+  await recordSuppressedQuestion("ses_1", "first question")
+  await recordSuppressedQuestion("ses_1", "second question")
+
+  const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    goals: Record<string, { questionsSuppressed: number; history: { type: string; detail: string }[] }>
+  }
+  expect(persisted.goals.ses_1?.questionsSuppressed).toBe(2)
+  expect(persisted.goals.ses_1?.history.filter((entry) => entry.type === "warning")).toHaveLength(2)
+
+  expect((await getGoal("ses_1"))?.questionsSuppressed).toBe(2)
+  expect(getGoalSync("ses_1")?.questionsSuppressed).toBe(2)
+})
+
+// Forward compatibility: a state file written by an older plugin has no
+// questionsSuppressed key. It must still decode, keep every other field, and
+// read back as the number 0 rather than undefined or NaN.
+test("state written by an older plugin without questionsSuppressed decodes to zero", async () => {
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, legacyStateFile({}), "utf8")
+
+  const goal = await getGoal("ses_1")
+
+  expect(goal).not.toBeNull()
+  expect(goal?.questionsSuppressed).toBe(0)
+  expect(typeof goal?.questionsSuppressed).toBe("number")
+  expect(Number.isNaN(goal?.questionsSuppressed)).toBe(false)
+  expect(goal?.objective).toBe("finish the migration")
+  expect(goal?.status).toBe("active")
+  expect(goal?.tokenBudget).toBe(5000)
+  expect(goal?.tokensUsed).toBe(120)
+  expect(goal?.autoTurns).toBe(3)
+  expect(getGoalSync("ses_1")?.questionsSuppressed).toBe(0)
+
+  // The upgraded plugin can start counting on a goal it inherited.
+  expect((await recordSuppressedQuestion("ses_1", "inherited goal"))?.questionsSuppressed).toBe(1)
+})
+
+// nonNegativeInteger only accepts a safe integer >= 0; everything else falls
+// back to 0. This runs through the exported snapshot(), which calls
+// normalizeGoal directly, so values the persistence schema would reject are
+// still covered.
+test("normalizeGoal coerces a corrupt questionsSuppressed to zero", async () => {
+  await createGoal("ses_1", "ship the plugin", null)
+
+  for (const corrupt of ["3", null, undefined, -1, -0.5, 2.5, Number.NaN, Number.POSITIVE_INFINITY, {}, []]) {
+    const goal = await persistedGoal("ses_1")
+    ;(goal as unknown as Record<string, unknown>).questionsSuppressed = corrupt
+    expect(snapshot(goal).questionsSuppressed).toBe(0)
+  }
+
+  const valid = await persistedGoal("ses_1")
+  valid.questionsSuppressed = 7
+  expect(snapshot(valid).questionsSuppressed).toBe(7)
+})
+
+test("a persisted negative or fractional questionsSuppressed normalizes to zero on read", async () => {
+  for (const corrupt of [-5, -0.5, 2.5, 1e21]) {
+    await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, legacyStateFile({ questionsSuppressed: corrupt }), "utf8")
+
+    const goal = await getGoal("ses_1")
+
+    expect(goal?.questionsSuppressed).toBe(0)
+    expect(goal?.objective).toBe("finish the migration")
+  }
+})
+
+// A non-numeric value is rejected by GoalSchema (Schema.Number) before
+// normalizeGoal ever runs, so the read fails loudly instead of coercing. The
+// on-disk file is left untouched rather than being overwritten with a repair.
+test("a persisted non-numeric questionsSuppressed fails the schema instead of being coerced", async () => {
+  for (const corrupt of ['"3"', "null", "true"]) {
+    const raw = legacyStateFile({}).replace('"lastContinuationAt":null', `"lastContinuationAt":null,"questionsSuppressed":${corrupt}`)
+    await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, raw, "utf8")
+
+    await expect(getGoal("ses_1")).rejects.toThrow()
+    expect(() => getGoalSync("ses_1")).toThrow()
+    expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(raw)
+  }
+})
+
+// This is why recordSuppressedQuestion reuses the existing "warning" type. A
+// brand-new history literal makes the whole state file undecodable by an older
+// plugin, and the read fails for EVERY goal in the file, not just the one
+// carrying the new entry.
+test("reusing the warning history type keeps the state file decodable", async () => {
+  const entryFor = (type: string) => ({ history: [{ type, detail: "Question tool blocked by goal policy: why?", timestamp: 1 }] })
+
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, legacyStateFile(entryFor("warning")), "utf8")
+  const decoded = await getGoal("ses_1")
+  expect(decoded?.history).toHaveLength(1)
+  expect(decoded?.history[0]?.type).toBe("warning")
+  expect(decoded?.history[0]?.detail).toBe("Question tool blocked by goal policy: why?")
+
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, legacyStateFile(entryFor("questionSuppressed")), "utf8")
+  await expect(getGoal("ses_1")).rejects.toThrow()
+  expect(() => getGoalSync("ses_1")).toThrow()
+})
+
+test("formatGoal renders the suppressed-question count once it is above zero", async () => {
+  await createGoal("ses_1", "ship the plugin", null)
+  expect(formatGoal(await getGoal("ses_1"))).not.toContain("Questions suppressed")
+
+  await recordSuppressedQuestion("ses_1", "which database?")
+  expect(formatGoal(await getGoal("ses_1"))).toContain("Questions suppressed: 1")
+
+  await recordSuppressedQuestion("ses_1", "which cache?")
+  const rendered = formatGoal(await getGoal("ses_1"))
+
+  expect(rendered).toContain("Questions suppressed: 2")
+  expect(rendered.match(/^Questions suppressed: /gm)).toHaveLength(1)
+  expect(rendered.split("\n")).toContain("Questions suppressed: 2")
 })

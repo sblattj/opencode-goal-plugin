@@ -20,6 +20,7 @@ import {
   recordAssistantProgress,
   recordContinuationResult,
   recordPromptAgent,
+  recordSuppressedQuestion,
   recordToolProgress,
   markPendingContinuationStarted,
   reserveContinuation,
@@ -28,7 +29,15 @@ import {
   updateGoalObjective,
   validateObjective,
 } from "./state"
-import { compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
+import {
+  compactionContext,
+  continuationPrompt,
+  limitPrompt,
+  questionBlockedMessage,
+  questionPolicyReminder,
+  systemReminder,
+  type QuestionPolicy,
+} from "./prompts"
 
 type Options = {
   auto_continue?: boolean
@@ -45,6 +54,7 @@ type Options = {
   max_no_progress_turns?: number
   restricted_agents?: string[]
   allow_goal_execution_from_plan?: boolean
+  question_policy?: string
 }
 
 type CreateGoalArgs = {
@@ -80,6 +90,32 @@ const TRANSPORT_ERROR_PATTERN =
   /\b(?:network|fetch|socket|connect|connection|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|transport|stream|websocket|offline|internet|request failed|proxy)\b/i
 const NON_TRANSPORT_TERMINAL_PATTERN = /\b(?:abort(?:ed)?|interrupt(?:ed|ion)?)\b/i
 const NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals"])
+// OpenCode's built-in tool for asking the user questions mid-turn. It is the
+// one tool that can stall an unattended goal indefinitely, because it waits
+// on a human who is not watching the terminal.
+//
+// Two other ways to stop it were traced through the opencode 1.18.23 bundle and
+// rejected, both for the same reason: they cannot be made conditional on THIS
+// session's goal.
+//
+//   - Registering a plugin tool under the id "question" does override the
+//     built-in (the registry is an object keyed by tool id and the plugin entry
+//     is appended last, so it simply wins). But a plugin tool is registered once
+//     for the whole process, so it would replace the question tool in every
+//     session, goal or no goal.
+//   - The "permission.ask" hook is unreachable here: the runtime fires
+//     tool.execute.before and only then the tool's own execute, and the question
+//     permission assert lives inside that execute. It is also the wrong shape --
+//     a declined permission is turned into an Effect defect rather than a
+//     recoverable tool error, so denying there risks killing the turn instead of
+//     failing one tool call.
+//
+// Config-level "permission": {"question": "deny"} and "tools": {"question":
+// false} both work and both are unconditional; they are the right answer for a
+// user who never wants questions, and the wrong one for a policy that lifts the
+// moment a goal is paused.
+const QUESTION_TOOL = "question"
+const DEFAULT_QUESTION_POLICY: QuestionPolicy = "decide"
 const TASK_TERMINAL_STATES = new Set<TaskState>(["completed", "error", "cancelled"])
 const PLAN_MODE_CREATE_NOTICE =
   'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.'
@@ -157,6 +193,32 @@ Use the goal tools to handle this command:
 - Otherwise, call get_goal first. If it returns a non-closed goal with the same objective, do not create it again; continue working from the returned state. If it returns a different non-closed goal, report that conflict instead of replacing it. Only when there is no non-closed goal, call create_goal once. Use the full arguments as the objective. If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to create_goal rather than leaving those words in the objective.
 
 Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds or returns an existing matching goal, never call it again for this command; continue working from the returned goal state.`
+}
+
+function questionPolicyFromOptions(options?: Options): QuestionPolicy {
+  const raw = typeof options?.question_policy === "string" ? options.question_policy.trim().toLowerCase() : ""
+  if (raw === "allow" || raw === "decide" || raw === "deny") return raw
+  // An unrecognised value falls back to the default rather than throwing: a
+  // typo in a config file should not take the whole plugin down at load.
+  return DEFAULT_QUESTION_POLICY
+}
+
+function isQuestionTool(tool: unknown) {
+  return typeof tool === "string" && tool.trim().toLowerCase() === QUESTION_TOOL
+}
+
+// Pulls the human-readable question out of the tool call so the block message
+// and the goal history can both name what the model was about to ask. The
+// built-in tool takes { questions: [{ question: string, ... }] }; anything that
+// does not match that shape degrades to no text rather than to a crash.
+function questionTextFromArgs(args: unknown) {
+  if (!isRecord(args)) return ""
+  const questions = args.questions
+  if (!Array.isArray(questions)) return ""
+  const texts = questions
+    .map((entry) => (isRecord(entry) && typeof entry.question === "string" ? entry.question.trim() : ""))
+    .filter(Boolean)
+  return texts.join(" | ")
 }
 
 function commandNameFromOptions(options?: Options) {
@@ -925,6 +987,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const maxPromptFailures = positiveIntegerOrNull(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options?.register_command ?? true
   const commandName = commandNameFromOptions(options)
+  const questionPolicy = questionPolicyFromOptions(options)
   const taskTracker = new TaskTracker()
   const taskDeferredSessions = new Set<string>()
   const scheduledContinuations = new Map<string, ScheduledContinuation>()
@@ -947,6 +1010,16 @@ const server: Plugin = async ({ client }, options?: Options) => {
   // Set by dispose so in-flight operations triggered before disposal cannot
   // schedule new timers or invoke continuations afterward.
   let disposed = false
+
+  // True only while the policy is in force AND this session's goal is
+  // actually running. A paused, limited, or closed goal is a session where the
+  // user is back in the loop, so questions are exactly what should happen.
+  async function questionsAreBlocked(sessionID: unknown) {
+    if (questionPolicy === "allow") return false
+    if (typeof sessionID !== "string" || !sessionID) return false
+    const goal = await getGoal(sessionID)
+    return goal?.status === "active"
+  }
 
   async function taskBlockStatus(sessionID: string) {
     if (!deferWhileTasksActive) return false
@@ -1350,10 +1423,21 @@ const server: Plugin = async ({ client }, options?: Options) => {
         },
       },
     },
-    async "tool.execute.before"(input) {
+    async "tool.execute.before"(input, output) {
       taskTracker.noteTaskCall(input as { tool?: unknown; sessionID?: unknown; callID?: unknown })
       const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input?.callID === "string" ? input.callID : undefined
+      // Throwing here is what actually stops the question. OpenCode runs this
+      // hook inside the tool's own execute and does not catch, so the rejection
+      // becomes the tool's error result and the message below is what the model
+      // reads. It is deliberately the last line of defence: the system-prompt
+      // policy should have prevented the call, and this catches the turn where
+      // it did not.
+      if (isQuestionTool(input?.tool) && (await questionsAreBlocked(sessionID))) {
+        const asked = questionTextFromArgs((output as { args?: unknown } | undefined)?.args)
+        if (sessionID) await recordSuppressedQuestion(sessionID, asked)
+        throw new Error(questionBlockedMessage(questionPolicy, asked))
+      }
       if (sessionID && callID) {
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
@@ -1413,6 +1497,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
     async "experimental.chat.system.transform"(input, output) {
       if (typeof input.sessionID !== "string") return
       mergeSystemReminder(output, systemReminder())
+      // Prevention, and the only half of this feature that tells the model what
+      // to do INSTEAD of asking. The gates below can stop a question; only this
+      // can turn it into a decision.
+      if (await questionsAreBlocked(input.sessionID)) mergeSystemReminder(output, questionPolicyReminder(questionPolicy))
     },
     async "experimental.session.compacting"(input, output) {
       const goal = await getGoal(input.sessionID)
@@ -1569,6 +1657,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const maxPromptFailures = positiveIntegerOrNull(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options.register_command ?? true
   const commandName = commandNameFromOptions(options)
+  const questionPolicy = questionPolicyFromOptions(options)
   const taskTracker = new TaskTracker()
   const taskDeferredSessions = new Set<string>()
   const scheduledContinuations = new Map<string, ScheduledContinuation>()
@@ -2113,6 +2202,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     )
   }
 
+  async function questionsAreBlocked(sessionID: unknown) {
+    if (questionPolicy === "allow") return false
+    if (typeof sessionID !== "string" || !sessionID) return false
+    const goal = await getGoal(sessionID)
+    return goal?.status === "active"
+  }
+
   registrations.push(
     await context.tool.transform((draft) => {
       for (const tool of goalToolsV2(goalServices)) draft.add(tool)
@@ -2124,6 +2220,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id })
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input.id === "string" ? input.id : undefined
+      if (isQuestionTool(input.tool) && (await questionsAreBlocked(sessionID))) {
+        const asked = questionTextFromArgs(input.input)
+        if (sessionID) await recordSuppressedQuestion(sessionID, asked)
+        throw new Error(questionBlockedMessage(questionPolicy, asked))
+      }
       if (sessionID && callID) {
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
@@ -2166,10 +2267,22 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   )
 
   registrations.push(
-    await context.session.hook("context", (sessionContext) => {
+    await context.session.hook("context", async (sessionContext) => {
       const reminder = systemReminder()
-      if (sessionContext.system.some((part) => part.type === "text" && part.text.includes(reminder))) return
-      sessionContext.system.push({ type: "text", text: reminder })
+      if (!sessionContext.system.some((part) => part.type === "text" && part.text.includes(reminder))) {
+        sessionContext.system.push({ type: "text", text: reminder })
+      }
+      if (!(await questionsAreBlocked(sessionContext.sessionID))) return
+      const policy = questionPolicyReminder(questionPolicy)
+      if (policy && !sessionContext.system.some((part) => part.type === "text" && part.text.includes(policy))) {
+        sessionContext.system.push({ type: "text", text: policy })
+      }
+      // v2 can do what v1 cannot: drop the tool from the set this session is
+      // offered, so the model never sees it. A tool it cannot see is a question
+      // it cannot ask, which beats blocking the call after the model has already
+      // decided to stall. The v1 gates stay as the backstop for the runtime that
+      // still loads the v1 entry point.
+      if (sessionContext.tools) delete sessionContext.tools[QUESTION_TOOL]
     }),
   )
 
