@@ -1421,7 +1421,22 @@ const server: Plugin = async ({ client }, options?: Options) => {
     },
     async "experimental.compaction.autocontinue"(input, output) {
       const goal = await getGoal(input.sessionID)
-      if (goal?.status === "active") output.enabled = false
+      if (goal?.status === "active") {
+        output.enabled = false
+        // Native autocontinue stays suppressed so the goal-specific
+        // continuation prompt remains authoritative, but suppressing it also
+        // suppresses the session.idle event that normally drives
+        // runAutoContinue. Schedule the recovery continuation here so the
+        // stranded awaitingContinuationProgress flag still gets cleared and the
+        // next continuation is reserved. Mirrors the session.error recovery path.
+        if (autoContinue)
+          scheduleSettledContinuation(
+            input.sessionID,
+            continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
+            false,
+            "recovery",
+          )
+      }
     },
     async event({ event }) {
       const sessionID = sessionIDFromEvent(event as never)

@@ -2337,8 +2337,11 @@ var server = async ({ client }, options) => {
     },
     async "experimental.compaction.autocontinue"(input, output) {
       const goal = await getGoal(input.sessionID);
-      if (goal?.status === "active")
+      if (goal?.status === "active") {
         output.enabled = false;
+        if (autoContinue)
+          scheduleSettledContinuation(input.sessionID, continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt), false, "recovery");
+      }
     },
     async event({ event }) {
       const sessionID = sessionIDFromEvent(event);
