@@ -1,18 +1,25 @@
 # OpenCode Goal Plugin
 
-[![npm version](https://img.shields.io/npm/v/@prevalentware/opencode-goal-plugin.svg)](https://www.npmjs.com/package/@prevalentware/opencode-goal-plugin)
-[![GitHub repository](https://img.shields.io/badge/GitHub-prevalentWare%2Fopencode--goal--plugin-blue?logo=github)](https://github.com/prevalentWare/opencode-goal-plugin)
+[![GitHub repository](https://img.shields.io/badge/GitHub-sblattj%2Fopencode--goal--plugin-blue?logo=github)](https://github.com/sblattj/opencode-goal-plugin)
+[![Fork of prevalentWare/opencode-goal-plugin](https://img.shields.io/badge/fork%20of-prevalentWare%2Fopencode--goal--plugin-lightgrey?logo=github)](https://github.com/prevalentWare/opencode-goal-plugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> **This is a fork.** `sblattj/opencode-goal-plugin` is an independently maintained hard fork of
+> [`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin),
+> originally written by Prevalentware and used here under the MIT licence. It carries a fix for goal
+> auto-continuation after compaction that upstream does not have. It is **not** affiliated with,
+> endorsed by, or supported by the original authors — please do not send them issues about this fork.
+> See [Attribution and licence](#attribution-and-licence).
 
 OpenCode Goal Plugin adds Codex-style long-running goal mode to OpenCode. It gives AI coding agents a `/goal` slash command, persistent goal state, completion evidence, idle continuation, and a terminal UI goal indicator so an OpenCode session can keep working toward one explicit objective until it is complete, blocked, or cleared.
 
-If you are searching for an OpenCode goal plugin, goal mode for OpenCode, or a way to keep an OpenCode AI coding agent focused on a long-running task, this package is the npm plugin for that workflow.
+If you are searching for an OpenCode goal plugin, goal mode for OpenCode, or a way to keep an OpenCode AI coding agent focused on a long-running task, this repository is the plugin for that workflow.
 
 Links:
 
-- npm package: [`@prevalentware/opencode-goal-plugin`](https://www.npmjs.com/package/@prevalentware/opencode-goal-plugin)
-- GitHub repository: [`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin)
-- OpenCode plugin command: `opencode plugin @prevalentware/opencode-goal-plugin`
+- GitHub repository: [`sblattj/opencode-goal-plugin`](https://github.com/sblattj/opencode-goal-plugin)
+- Upstream project: [`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin) (MIT)
+- Install source: `github:sblattj/opencode-goal-plugin` — see [Install](#install). **This fork is not published to npm.**
 
 The OpenCode Goal Plugin adds:
 
@@ -24,6 +31,76 @@ The OpenCode Goal Plugin adds:
 - Optional automatic continuation on `session.idle` / `session.status`, with no-progress pause and budget wrap-up safeguards.
 - Plan-mode safety: goals created from the `plan` agent stay paused, and auto-continue never escapes a Plan-mode session or switches agents on its own.
 - Compaction context so active goals are preserved when OpenCode summarizes a long session.
+
+## What This Fork Changes
+
+One behavioural fix, plus the identity and packaging changes that follow from being a fork.
+
+**The symptom.** An active goal stops auto-continuing after auto-compaction, silently. Nothing is logged
+to `~/.local/share/opencode/log`; the session simply stops making progress.
+
+**Why it happens.** The plugin deliberately suppresses OpenCode's native post-compaction "continue"
+turn so its own goal-specific continuation prompt stays authoritative:
+
+```ts
+async "experimental.compaction.autocontinue"(input, output) {
+  const goal = await getGoal(input.sessionID)
+  if (goal?.status === "active") output.enabled = false
+},
+```
+
+Having suppressed the native resume, the plugin then relies on a `session.idle` event to drive
+`runAutoContinue()`. After a *suppressed* compaction no idle event arrives, so `runAutoContinue()`
+never runs — and it is the only path that both clears the stranded `awaitingContinuationProgress`
+flag (via `recordAssistantMessage(..., evaluateContinuation=true)`) and reserves the next
+continuation. The event-only paths clear `pendingAttempt` but never clear `awaiting`, and that
+asymmetry is why the flag strands.
+
+**Observed evidence** (live state in `~/.local/share/opencode-goal-plugin/goals.json`, 2026-08-28): an
+active goal with `awaitingContinuationProgress: true` but `pendingAttempt: null`, `autoTurns` frozen at
+1 across roughly nine minutes of real work and logged checkpoints, `lastAssistantMessageID` ahead of
+`continuationBaselineMessageID` (so work *had* happened), about 4.97M tokens used across many
+compactions, and no errors anywhere.
+
+**The fix.** Keep the original intent — native autocontinue stays suppressed — but guarantee a trigger
+by scheduling a `"recovery"` continuation straight from the compaction hook, mirroring the
+`session.error` recovery pattern already in the same file:
+
+```diff
+     async "experimental.compaction.autocontinue"(input, output) {
+       const goal = await getGoal(input.sessionID)
+-      if (goal?.status === "active") output.enabled = false
++      if (goal?.status === "active") {
++        output.enabled = false
++        if (autoContinue)
++          scheduleSettledContinuation(
++            input.sessionID,
++            continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
++            false,
++            "recovery",
++          )
++      }
+     },
+```
+
+The scheduled timer fires `runAutoContinue()` once the turn settles, which clears the stranded
+`awaiting` flag and reserves a fresh continuation. `scheduleSettledContinuation(…, false, …)` will not
+stack on an existing scheduled continuation, and `reserveContinuation`'s `min_continue_interval` guard
+prevents a double-continue.
+
+**Scope.** `src/server.ts` exports two implementations. `"experimental.compaction.autocontinue"` is
+registered only in the **v1** `server` export; `setupV2` never registers a compaction hook, so there is
+no equivalent bug on the OpenCode 2 path. The v1 path is the one that runs against OpenCode 1.x.
+
+**How far this is verified.** Unit tests, typecheck, lint, and `node --check` all pass, and the compiled
+`dist/server.js` contains the scheduled recovery call inside the compaction hook. A live goal surviving a
+real compaction end to end has **not** yet been observed and recorded. The change has not been submitted
+upstream, so upstream carries neither the fix nor any statement about this behaviour.
+
+**Packaging changes.** The package is renamed to `@sblattj/opencode-goal-plugin` so a `bun add` of this
+fork no longer claims upstream's `node_modules/@prevalentware/opencode-goal-plugin` slot, and the
+homepage, bugs, and repository URLs point at this repository. The built `dist/server.js` is committed
+here on purpose, because a `github:` install runs no build step.
 
 ## Why Use This OpenCode Goal Plugin?
 
@@ -38,38 +115,66 @@ Common use cases:
 
 ## Install
 
-Choose the instructions that match the CLI you run:
+**There is no npm package for this fork.** `opencode plugin @sblattj/opencode-goal-plugin` will not
+work, and neither will a bare `github:` entry in the `plugin` array — see
+[Why a bare `github:` entry does not work](#why-a-bare-github-entry-does-not-work). Install by
+vendoring the repository and pointing OpenCode at the built `dist/server.js` file.
 
-| OpenCode version | How to identify it | Instructions |
-| --- | --- | --- |
-| OpenCode 1 stable | You run `opencode` and `opencode --version` prints `1.x` | [OpenCode 1](#opencode-1-stable) |
-| OpenCode 2 beta | You run `opencode2` | [OpenCode 2](#opencode-2-beta) |
+Requirements: [Bun](https://bun.sh) and OpenCode `>= 1.17.1`.
 
-Do not mix the configuration formats. OpenCode 1 uses `plugin` and `tui.json`; OpenCode 2 uses `plugins` and the global `cli.json`.
+### Option 1: Vendor It With Bun (Recommended)
 
-### OpenCode 1 Stable
-
-Install for the current project:
+From your project root:
 
 ```bash
-opencode plugin @prevalentware/opencode-goal-plugin
+bun add github:sblattj/opencode-goal-plugin
 ```
 
-Install globally:
-
-```bash
-opencode plugin -g @prevalentware/opencode-goal-plugin
-```
-
-OpenCode detects both package entrypoints and writes the plugin into the server and TUI config targets.
-
-For manual installation, add the package to both V1 config files.
+That installs the fork at `node_modules/@sblattj/opencode-goal-plugin`, built bundle included. Then
+point OpenCode at the bundle. Paths in the `plugin` array are resolved relative to the project
+directory:
 
 `opencode.json`:
 
 ```json
 {
-  "plugin": ["@prevalentware/opencode-goal-plugin"]
+  "plugin": ["./node_modules/@sblattj/opencode-goal-plugin/dist/server.js"]
+}
+```
+
+`tui.json` (OpenCode 1 only — the TUI sidebar loads from a separate config target and a **different**
+entrypoint file):
+
+```json
+{
+  "plugin": ["./node_modules/@sblattj/opencode-goal-plugin/src/tui.ts"]
+}
+```
+
+The two config targets take different files on purpose. When OpenCode installs a plugin by npm package
+name it picks the right entrypoint out of the `exports` map (`./server` and `./tui`); a file path
+skips that map, so each target has to name its own file. The server hooks, tools, and goal state work
+without the TUI entry — it only adds the sidebar indicator and command-palette item.
+
+To install it for every project instead, put **absolute** paths in your global
+`~/.config/opencode/opencode.json` and `~/.config/opencode/tui.json` rather than relative ones.
+
+### Option 2: Clone And Build
+
+```bash
+git clone https://github.com/sblattj/opencode-goal-plugin.git
+cd opencode-goal-plugin
+bun install
+bun run build    # optional: dist/server.js is committed
+```
+
+Then reference the absolute paths from your OpenCode config:
+
+`opencode.json`:
+
+```json
+{
+  "plugin": ["/absolute/path/to/opencode-goal-plugin/dist/server.js"]
 }
 ```
 
@@ -77,21 +182,37 @@ For manual installation, add the package to both V1 config files.
 
 ```json
 {
-  "plugin": ["@prevalentware/opencode-goal-plugin"]
+  "plugin": ["/absolute/path/to/opencode-goal-plugin/src/tui.ts"]
 }
+```
+
+This is the fastest way to iterate on the plugin itself, because an edit plus `bun run build` is
+immediately live on the next OpenCode start. Confirm what OpenCode actually resolved, rather than the
+file you edited — OpenCode merges every config file it finds and *concatenates* array keys, so a
+leftover entry elsewhere will load a second copy of the plugin:
+
+```bash
+opencode debug config | python3 -c "import json,sys; print(json.load(sys.stdin)['plugin'])"
 ```
 
 ### OpenCode 2 Beta
 
-Use this section only when running `opencode2`. Plugin release `0.1.30` and newer supports OpenCode 2 preview `0.0.0-next-17055` while remaining compatible with OpenCode 1.
+Use this section only when running `opencode2`. This tree carries upstream's OpenCode 2 support,
+developed against OpenCode 2 preview `0.0.0-next-17055` while remaining compatible with OpenCode 1.
 
-Add the package to both V2 plugin lists:
+OpenCode 2 uses `plugins` (not `plugin`) and the global `cli.json` (not `tui.json`). Do not mix the two
+configuration formats.
+
+The config below adapts upstream's npm-package instructions to this fork's file-path install. **It has
+not been exercised against an `opencode2` build**, unlike the OpenCode 1 instructions above; if
+OpenCode 2 rejects a path where it expects a package specifier, please
+[open an issue](https://github.com/sblattj/opencode-goal-plugin/issues).
 
 `opencode.json`:
 
 ```json
 {
-  "plugins": ["@prevalentware/opencode-goal-plugin"]
+  "plugins": ["./node_modules/@sblattj/opencode-goal-plugin/dist/server.js"]
 }
 ```
 
@@ -99,13 +220,32 @@ Add the package to both V2 plugin lists:
 
 ```json
 {
-  "plugins": ["@prevalentware/opencode-goal-plugin"]
+  "plugins": ["/absolute/path/to/node_modules/@sblattj/opencode-goal-plugin/src/tui.ts"]
 }
 ```
 
 OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint comes from `opencode.json`, while the sidebar and palette integration come from `~/.config/opencode/cli.json`.
 
-OpenCode 2 plugin APIs are still beta. This package pins its V2 development contract to the preview version above; later previews may require a compatible plugin update. V2 currently supports the goal command, tools, persistent state, usage accounting, idle continuation, Plan-mode safety, and TUI sidebar/palette integration. Goal-specific compaction context and recovery of already-running child sessions after a plugin restart remain V1-only because the current V2 plugin context does not expose equivalent hooks or history queries.
+OpenCode 2 plugin APIs are still beta. This package pins its V2 development contract to the preview version above; later previews may require a compatible plugin update. V2 currently supports the goal command, tools, persistent state, usage accounting, idle continuation, Plan-mode safety, and TUI sidebar/palette integration. Goal-specific compaction context and recovery of already-running child sessions after a plugin restart remain V1-only because the current V2 plugin context does not expose equivalent hooks or history queries. This fork's compaction fix is likewise V1-only.
+
+### Why A Bare `github:` Entry Does Not Work
+
+Two shorter-looking config entries both fail, which is why the instructions above go through a file
+path. Checked against OpenCode 1.18.23:
+
+- `"plugin": ["github:sblattj/opencode-goal-plugin"]` is accepted into OpenCode's resolved config but
+  never installs anything usable. It produces a cache directory at
+  `~/.cache/opencode/packages/github:sblattj/opencode-goal-plugin/` holding only a partial dependency
+  tree — no `package.json`, no installed package, no `dist/server.js` — so there is nothing to import.
+  An npm-style entry, by contrast, gets a generated `package.json` and a complete install in the same
+  cache location.
+- `"plugin": ["@sblattj/opencode-goal-plugin"]` makes OpenCode try to install that name **from npm**
+  into its own cache rather than resolving it from your project's `node_modules`. This fork is not on
+  npm, so the install 404s and leaves an empty
+  `~/.cache/opencode/packages/@sblattj/opencode-goal-plugin@latest/` directory.
+
+`bun add github:sblattj/opencode-goal-plugin` **does** work — it is only OpenCode's own plugin
+resolver that cannot take either form. That is why Option 1 uses Bun to fetch and a file path to load.
 
 ## Options
 
@@ -115,7 +255,7 @@ In OpenCode 1, server options use the package-and-options tuple in `opencode.jso
 {
   "plugin": [
     [
-      "@prevalentware/opencode-goal-plugin",
+      "./node_modules/@sblattj/opencode-goal-plugin/dist/server.js",
       {
         "auto_continue": true,
         "defer_while_tasks_active": true,
@@ -141,7 +281,7 @@ In OpenCode 2, use the plugin object form instead:
 {
   "plugins": [
     {
-      "package": "@prevalentware/opencode-goal-plugin",
+      "package": "./node_modules/@sblattj/opencode-goal-plugin/dist/server.js",
       "options": {
         "auto_continue": true,
         "max_auto_turns": 25,
@@ -225,15 +365,39 @@ If `XDG_DATA_HOME` is not set, the default is:
 
 Set `OPENCODE_GOAL_STATE_PATH` to use a custom file.
 
+That directory name comes from a literal in `src/state.ts`, not from the package name, so it is
+unchanged by this fork's rename. An existing install's goal state carries over as is.
+
 The state file is written atomically through a same-directory temp file: the final path is only ever replaced by a fully-flushed file, so after a crash the state is the previous or the new valid version, never a torn one. The file is created with owner-only permissions where the host filesystem supports them, and the temp name is a random UUID opened exclusively so concurrent writers cannot collide.
 
 Ordinary fsync improves crash consistency but is not `F_FULLFSYNC`, so sudden power loss on macOS/APFS is not an absolute durability guarantee; where the platform cannot fsync the parent directory, a crash may leave the old or the new state file (both valid), never a partially-written one. Existing active goals recover from disk with their full objective, budget, history, and checkpoint metadata.
 
 If the rename succeeds but syncing the parent directory reports a genuine I/O error, the mutation reports a write failure even though the new valid state may already be present. This avoids claiming durability that the filesystem did not confirm.
 
+## Attribution And Licence
+
+This project is a hard fork of
+[`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin), created
+and originally authored by **Prevalentware**. Essentially all of the design and implementation in this
+repository — goal lifecycle, tools, persistence, Plan-mode safety, the TUI indicator, the tests, and
+this documentation — is their work. The fork adds one behavioural fix and the packaging changes
+described in [What this fork changes](#what-this-fork-changes).
+
+It is a *hard* fork rather than a GitHub fork: the history was cloned into a fresh repository. Upstream
+remains wired up as the `upstream` git remote, so changes can be pulled forward with
+`git fetch upstream && git merge upstream/main`.
+
+The upstream project is MIT licensed, and this fork stays MIT licensed. The [`LICENSE`](LICENSE) file is
+unmodified and still carries the original copyright notice, as the MIT licence requires. Nothing here
+implies that Prevalentware endorses, reviewed, or supports this fork. **Bugs found in this fork belong
+in [this repository's issue tracker](https://github.com/sblattj/opencode-goal-plugin/issues), not
+upstream's.**
+
 ## Credits
 
-This plugin follows Codex's native goal-mode semantics where OpenCode plugin hooks allow it. Several hardening ideas were adapted from William Ricchiuti's [`willytop8/OpenCode-goal-plugin`](https://github.com/willytop8/OpenCode-goal-plugin), especially lifecycle history, checkpoints, no-progress safeguards, budget wrap-up behavior, and strict-provider-safe system prompt merging. Thank you, William.
+- **Prevalentware** — original author of `prevalentWare/opencode-goal-plugin`, which this repository forks.
+- This plugin follows Codex's native goal-mode semantics where OpenCode plugin hooks allow it.
+- Several hardening ideas were adapted from William Ricchiuti's [`willytop8/OpenCode-goal-plugin`](https://github.com/willytop8/OpenCode-goal-plugin), especially lifecycle history, checkpoints, no-progress safeguards, budget wrap-up behavior, and strict-provider-safe system prompt merging. Thank you, William.
 
 ## Development
 
@@ -243,21 +407,31 @@ bun run test
 bun run lint
 bun run typecheck
 bun run build
-npm pack --dry-run
 ```
 
-## Publishing
+`bun run build` writes `dist/server.js`, which is **committed on purpose**: OpenCode and Bun run no build
+step on a `github:` or file-path install, so the bundle has to be in the repository. Rebuild and commit
+`dist/server.js` in the same change whenever `src/server.ts` or its imports change.
 
-This package is set up for npm Trusted Publishing from GitHub Actions. On every push to `main`, CI runs typecheck, lint, and unit tests in parallel. If they all pass, the publish job computes the next patch version from the latest version on npm, builds the package, and runs `npm publish`.
+## Releases
 
-Before the first automated publish, configure the package on npm:
+This fork does not publish to npm; there is no `@sblattj/opencode-goal-plugin` package on the registry,
+and installs come from this repository directly. The `publish.yml` workflow is inherited from upstream
+and still targets npm on every push to `main`. It has never run successfully for this fork and would
+need both an npm package and a Trusted Publisher configured against
+`sblattj/opencode-goal-plugin` before it could — treat it as inactive.
 
-1. Open the package settings on npmjs.com.
-2. Add a Trusted Publisher for GitHub Actions.
-3. Use repository `prevalentWare/opencode-goal-plugin`.
-4. Use workflow file `publish.yml`.
+## Report A Bug Or Contribute
 
-The repository must be public for npm provenance to be generated automatically.
+- **Bugs and feature requests:** open an issue at
+  [`sblattj/opencode-goal-plugin/issues`](https://github.com/sblattj/opencode-goal-plugin/issues/new/choose).
+  Include your OpenCode version, how you installed the plugin, and reproduction steps.
+- **Security issues:** do not open a public issue. See [SECURITY.md](SECURITY.md).
+- **Pull requests:** see [CONTRIBUTING.md](CONTRIBUTING.md) for the local gates and code style.
+- **Bugs that also exist upstream:** they are welcome here, but the upstream project is the right place
+  to get them fixed for everyone — please report those to
+  [`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin/issues)
+  as well.
 
 ## Notes
 
@@ -272,6 +446,6 @@ OpenCode plugin modules are target-specific. This package exports separate modul
 }
 ```
 
-Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode idle events, including `session.idle` and `session.status` idle notifications. The optional `max_turn_time` watchdog can retry one goal continuation prompt when a model turn remains busy, without consuming the goal's auto-turn, no-progress, or prompt-failure budgets. By default, continuation is deferred while OpenCode Task child sessions are active or their terminal result still needs an orchestrator turn. During compaction, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative.
+Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode idle events, including `session.idle` and `session.status` idle notifications. The optional `max_turn_time` watchdog can retry one goal continuation prompt when a model turn remains busy, without consuming the goal's auto-turn, no-progress, or prompt-failure budgets. By default, continuation is deferred while OpenCode Task child sessions are active or their terminal result still needs an orchestrator turn. During compaction, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative, and — in this fork — schedules its own recovery continuation so the goal is not stranded.
 
 The goal sidebar shows the current status, elapsed time, token usage, auto-continue count, latest checkpoint, latest status message, stop reason, and objective when a goal is active, paused, or safety-limited. Closed goals remain visible briefly through the latest tool state as achieved or unmet.

@@ -59,8 +59,11 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-desarrollo-web@prevalentware.com.
+reported to the maintainer of this repository, [@sblattj](https://github.com/sblattj),
+by opening an issue or a private security advisory on
+https://github.com/sblattj/opencode-goal-plugin. (No email address is configured for
+this fork; reports about it must not be sent to the upstream project's contact
+address.)
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the

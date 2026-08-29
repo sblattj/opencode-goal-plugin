@@ -1,9 +1,11 @@
 name: Publish
 
+# Manual only. This fork is not published to npm: the package is
+# @sblattj/opencode-goal-plugin, which has no npm package and no Trusted
+# Publisher, so a push-triggered run could only ever fail. Typecheck, lint and
+# unit tests still run on every push via ci.yml. Re-add the push trigger if the
+# scope is ever claimed on npm.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -60,20 +62,23 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run ci:version
-      - name: Read publish version
+      - name: Read publish name and version
         id: version
         run: |
           VERSION=$(node -p "require('./package.json').version")
+          PKG_NAME=$(node -p "require('./package.json').name")
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
       - run: bun run build
       - run: npm publish --ignore-scripts
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
+          PKG_NAME: ${{ steps.version.outputs.name }}
         run: |
           cat > release-notes.md <<EOF
-          Published npm version: @prevalentware/opencode-goal-plugin@${VERSION}
+          Published npm version: ${PKG_NAME}@${VERSION}
 
           Validation:
           - Typecheck passed.

@@ -8,7 +8,9 @@ body:
       value: |
         Thanks for taking the time to report a bug. Please fill in as much detail as you can — reproduction steps and environment info make fixes much faster.
 
-        If you believe this is a security issue, please do NOT file a public issue. Follow [SECURITY.md](https://github.com/prevalentWare/opencode-goal-plugin/blob/main/SECURITY.md) instead.
+        If you believe this is a security issue, please do NOT file a public issue. Follow [SECURITY.md](https://github.com/sblattj/opencode-goal-plugin/blob/main/SECURITY.md) instead.
+
+        This repository is a fork of [prevalentWare/opencode-goal-plugin](https://github.com/prevalentWare/opencode-goal-plugin). If you are running the upstream npm package rather than this fork, please report the bug upstream instead.
   - type: textarea
     id: description
     attributes:
@@ -30,7 +32,7 @@ body:
       label: Steps to reproduce
       description: Minimal steps to trigger the problem.
       placeholder: |
-        1. Install the plugin with `opencode plugin @prevalentware/opencode-goal-plugin`
+        1. Install the plugin with `bun add github:sblattj/opencode-goal-plugin` and point `opencode.json` at `./node_modules/@sblattj/opencode-goal-plugin/dist/server.js`
         2. Create a goal with `/goal ...`
         3. ...
     validations:
@@ -38,8 +40,8 @@ body:
   - type: input
     id: plugin-version
     attributes:
-      label: Plugin version
-      placeholder: e.g. 0.1.21
+      label: Plugin version or commit
+      placeholder: e.g. the short commit SHA you installed
     validations:
       required: true
   - type: input

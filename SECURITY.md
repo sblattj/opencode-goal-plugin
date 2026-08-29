@@ -2,24 +2,31 @@
 
 ## Supported Versions
 
-Only the latest version published to npm receives security fixes. Releases are
-automated: every merge to `main` publishes a new patch version, so upgrading to
-the latest release always includes all shipped fixes.
+Only the current `main` branch of this repository receives security fixes. This
+fork is not published to npm; installs come from the repository directly, so
+re-installing from `main` always includes all shipped fixes.
 
 | Version | Supported |
 | --- | --- |
-| Latest npm release | ✅ |
-| Older releases | ❌ |
+| Current `main` | ✅ |
+| Any older commit | ❌ |
+
+This repository is a fork of
+[`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin)
+(MIT). If a vulnerability also affects upstream, please report it there too — this
+fork's maintainer cannot fix it for upstream's users.
 
 ## Reporting a Vulnerability
 
 Please report security issues privately so a fix can be released before the
 details are public:
 
-- Preferred: open a private report through
-  [GitHub Security Advisories](https://github.com/prevalentWare/opencode-goal-plugin/security/advisories/new).
-- Alternatively, email desarrollo-web@prevalentware.com with a description,
-  reproduction steps, and the affected version.
+- Open a private report through
+  [GitHub Security Advisories on this repository](https://github.com/sblattj/opencode-goal-plugin/security/advisories/new),
+  with a description, reproduction steps, and the affected commit.
+
+There is no email contact configured for this fork. Do not send reports about it to
+the upstream project's security address — upstream does not maintain this code.
 
 Please do not open a public issue for suspected vulnerabilities.
 
@@ -27,7 +34,7 @@ Please do not open a public issue for suspected vulnerabilities.
 
 - We will acknowledge your report within 5 business days.
 - We will assess impact, work on a fix, and keep you informed of progress.
-- Once a fix is published to npm, we will credit you in the release notes if
+- Once a fix lands on `main`, we will credit you in the commit or release notes if
   you would like.
 
 ## Scope notes

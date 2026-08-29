@@ -1,7 +1,7 @@
 {
-  "name": "@prevalentware/opencode-goal-plugin",
+  "name": "@sblattj/opencode-goal-plugin",
   "version": "0.1.1",
-  "description": "OpenCode goal plugin that adds Codex-style long-running goal mode, /goal commands, persistence, and TUI status for AI coding agents.",
+  "description": "OpenCode goal plugin that adds Codex-style long-running goal mode, /goal commands, persistence, and TUI status for AI coding agents. Fork of @prevalentware/opencode-goal-plugin (MIT) carrying the post-compaction auto-continuation fix.",
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -17,16 +17,19 @@
     "agent",
     "tui"
   ],
-  "homepage": "https://github.com/prevalentWare/opencode-goal-plugin#readme",
+  "homepage": "https://github.com/sblattj/opencode-goal-plugin#readme",
   "bugs": {
-    "url": "https://github.com/prevalentWare/opencode-goal-plugin/issues"
+    "url": "https://github.com/sblattj/opencode-goal-plugin/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/prevalentWare/opencode-goal-plugin.git"
+    "url": "git+https://github.com/sblattj/opencode-goal-plugin.git"
   },
   "license": "MIT",
-  "author": "Prevalentware",
+  "author": "Stephen Blatt",
+  "contributors": [
+    "Prevalentware (original author of prevalentWare/opencode-goal-plugin)"
+  ],
   "type": "module",
   "exports": {
     "./server": {

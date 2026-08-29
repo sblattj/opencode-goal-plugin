@@ -1,6 +1,8 @@
 # Contributing to OpenCode Goal Plugin
 
-Thanks for your interest in improving `@prevalentware/opencode-goal-plugin`. This guide explains how to set up the project, make changes, and get them merged.
+Thanks for your interest in improving `@sblattj/opencode-goal-plugin`. This guide explains how to set up the project, make changes, and get them merged.
+
+This repository is a fork of [`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin) (MIT). If your change is not specific to this fork, consider sending it upstream as well so everyone gets it.
 
 ## Prerequisites
 
@@ -10,7 +12,7 @@ Thanks for your interest in improving `@prevalentware/opencode-goal-plugin`. Thi
 ## Getting started
 
 ```bash
-git clone https://github.com/prevalentWare/opencode-goal-plugin.git
+git clone https://github.com/sblattj/opencode-goal-plugin.git
 cd opencode-goal-plugin
 bun install
 ```
@@ -31,7 +33,7 @@ Useful scripts:
 - `src/server.ts` — OpenCode server hooks, goal tools, auto-continuation.
 - `src/state.ts` — persistent goal state, budgets, history, checkpoints.
 - `src/prompts.ts` — continuation, wrap-up, and system reminder prompts.
-- `src/tui.tsx` — terminal UI goal indicator and command palette entry.
+- `src/tui.ts` — terminal UI goal indicator and command palette entry.
 - `test/` — Bun test suites mirroring the source modules.
 - `CONTEXT.md` — shared domain vocabulary for goal-mode behavior.
 
@@ -47,11 +49,11 @@ Useful scripts:
 ## CI and releases
 
 - Every pull request runs typecheck, lint, tests with coverage, and a build via GitHub Actions. All checks must pass before merge.
-- Every push to `main` re-runs the gates and, if green, automatically publishes a patch release to npm and creates a GitHub release. Merging a PR ships it — please keep `main` releasable.
+- This fork does **not** publish to npm. Installs come straight from this repository, so `main` must always carry a rebuilt `dist/server.js` — that file is the release. The inherited `publish.yml` workflow still targets npm and is inactive for this fork.
 
 ## Reporting bugs and requesting features
 
-Use the [issue templates](https://github.com/prevalentWare/opencode-goal-plugin/issues/new/choose). Include your OpenCode version, plugin version, install method, and reproduction steps for bugs.
+Use the [issue templates](https://github.com/sblattj/opencode-goal-plugin/issues/new/choose). Include your OpenCode version, plugin version, install method, and reproduction steps for bugs.
 
 For security issues, do not open a public issue — see [SECURITY.md](SECURITY.md).
 

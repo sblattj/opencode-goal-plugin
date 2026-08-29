@@ -1,13 +1,14 @@
 # HANDOFF — why this fork exists, and what's left to do
 
-**Repo:** `sblattj/opencode-goal-plugin` (**private**)
+**Repo:** `sblattj/opencode-goal-plugin` (**public** since 2026-08-28; it was created private)
 **Upstream:** `prevalentWare/opencode-goal-plugin` (MIT) — kept as the `upstream` git remote
 **Created:** 2026-08-28
 **Status:** **the fix is APPLIED, built, and shipped to `main`** (`e4adfab`, 2026-08-28), and OpenCode on this host is wired to it. What remains is the optional upstream PR and a live behavioural confirmation — see §6.
 
-This is a **hard fork**, not a GitHub fork: GitHub forks of a public repo cannot be made private, so
-the history was cloned and pushed to a fresh private repo (`isFork=false`). Upstream is still wired
-up, so syncing later is `git fetch upstream && git merge upstream/main`.
+This is a **hard fork**, not a GitHub fork. It was created private, and GitHub forks of a public repo
+cannot be made private, so the history was cloned and pushed to a fresh repo (`isFork=false`). The repo
+has since been made **public**, but it remains a hard fork rather than a GitHub fork. Upstream is still
+wired up, so syncing later is `git fetch upstream && git merge upstream/main`.
 
 ---
 
@@ -103,16 +104,18 @@ unnecessary. `.gitignore`'s `dist/` line only ever suppressed *untracked* files,
 its real effect was to hide future `dist/` changes from `git status`. The line was
 removed anyway — that is the right cleanup.
 
-Note `package.json` says `0.1.1` while npm ships `0.1.39` — the published version is computed in CI
-by `scripts/resolve-ci-version.ts`, so the in-repo number is not the release number. Don't "fix" it.
+Note `package.json` says `0.1.1` while upstream's npm package ships `0.1.39` — upstream's published
+version is computed in CI by `scripts/resolve-ci-version.ts`, so the in-repo number was never the
+release number. This fork publishes nothing to npm, so the number is inert. Don't "fix" it.
 
 ## 4. Point OpenCode at this fork (done on this host)
 
 Two things the original version of this section got wrong, both found by
 `opencode debug config` rather than by reasoning:
 
-**`github:` does not work for a private repo.** Bun resolves it through an
-unauthenticated GitHub API call:
+**`github:` in OpenCode's `plugin` array does not work — for two different reasons,
+one of which is now fixed.** While the repo was private, Bun could not resolve it at
+all, through an unauthenticated GitHub API call:
 
 ```
 $ bun add github:sblattj/opencode-goal-plugin
@@ -120,7 +123,20 @@ error: GET https://api.github.com/repos/sblattj/opencode-goal-plugin/tarball/ - 
 error: github:sblattj/opencode-goal-plugin failed to resolve
 ```
 
-So the local-path form is the one in use — which is also the fastest way to
+That half is fixed: now that the repo is public, `bun add github:sblattj/opencode-goal-plugin`
+succeeds and installs the built bundle.
+
+But OpenCode's own plugin resolver still cannot take it (verified on OpenCode 1.18.23,
+2026-08-28). `"plugin": ["github:sblattj/opencode-goal-plugin"]` is accepted into the
+resolved config and then produces
+`~/.cache/opencode/packages/github:sblattj/opencode-goal-plugin/` containing only a
+partial dependency tree — no `package.json`, no installed package, no `dist/server.js`.
+The package-name form fails too: `"plugin": ["@sblattj/opencode-goal-plugin"]` makes
+OpenCode try an **npm** install into its own cache instead of reading the project's
+`node_modules`, which 404s and leaves an empty
+`~/.cache/opencode/packages/@sblattj/opencode-goal-plugin@latest/`.
+
+So the file-path form is the one in use — which is also the fastest way to
 iterate:
 
 ```jsonc
@@ -184,9 +200,9 @@ devDependency. The v1 path is the live one, which also matches the original bug 
 
 | Item | Value |
 |---|---|
-| This repo | `sblattj/opencode-goal-plugin` (private, hard fork) |
+| This repo | `sblattj/opencode-goal-plugin` (public, hard fork) |
 | Upstream | `prevalentWare/opencode-goal-plugin` (MIT), remote `upstream` |
 | File edited | `src/server.ts` — hook at **1422-1425** (v1 `server` export only) |
 | Build | `bun run build` → `dist/server.js` (must be committed here) |
-| Wire-up | local path — `github:` cannot resolve a private repo under Bun |
+| Wire-up | local file path — OpenCode's `plugin` array takes neither `github:` nor a bare package name |
 | State file | `~/.local/share/opencode-goal-plugin/goals.json` |
