@@ -3369,3 +3369,21 @@ test("malformed question arguments still block instead of crashing the gate", as
   }
   expect((await getGoal(sessionID))?.questionsSuppressed).toBe(malformed.length)
 })
+
+// The README's bullet is the only place the tool set is enumerated for a
+// reader, and it drifted silently: update_goal_status shipped and the list was
+// never updated, so the docs advertised eight of nine tools for as long as that
+// tool has existed. The expectation is derived from the registry rather than
+// from a second hand-maintained list, so the next tool added cannot repeat it.
+test("the README lists exactly the tools the plugin registers", async () => {
+  const hooks = await setupServer({ client: { session: { promptAsync: async () => {} } } } as never, {})
+  const registered = Object.keys(hooks.tool ?? {}).sort()
+  expect(registered.length).toBeGreaterThan(0)
+
+  const readme = await readFile("README.md", "utf8")
+  const line = readme.split("\n").find((candidate) => candidate.startsWith("- Agent tools:"))
+  if (!line) throw new Error("expected README.md to carry an '- Agent tools:' line")
+  const documented = [...line.matchAll(/`([a-z_]+)`/g)].map((match) => match[1]!).sort()
+
+  expect(documented).toEqual(registered)
+})

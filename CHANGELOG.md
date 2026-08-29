@@ -14,6 +14,17 @@ The fork is consumed as a local file path and is **not published to npm**. There
 is no `@sblattj/opencode-goal-plugin` package; `dist/server.js` is committed and
 self-contained, and that file is the artifact.
 
+## [0.2.1] — 2026-08-29
+
+### Fixed
+
+- **The README advertised eight of the nine agent tools.** `update_goal_status`
+  — the tool behind `/goal pause` and `/goal resume` — was missing from the tool
+  list, and had been for as long as that tool has existed. The list is corrected,
+  and a test now derives the expectation from the plugin's own tool registry
+  rather than from a second hand-maintained list, so the next tool added cannot
+  repeat the omission.
+
 ## [0.2.0] — 2026-08-29
 
 The first release of the fork. It contains everything that has diverged from
@@ -86,4 +97,5 @@ upstream `0aa2514`.
   npm, so a push-triggered run could only ever fail. Typecheck, lint and tests
   still run on every pull request via `ci.yml`.
 
+[0.2.1]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.2.1
 [0.2.0]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.2.0

@@ -25,7 +25,7 @@ The OpenCode Goal Plugin adds:
 
 - `/goal <objective>` as an OpenCode command for TUI, desktop, and web.
 - A sidebar goal indicator with status, elapsed time, and objective.
-- Agent tools: `get_goal`, `get_goal_history`, `list_all_goals`, `create_goal`, `set_goal`, `update_goal_objective`, `update_goal`, and `clear_goal`.
+- Agent tools: `get_goal`, `get_goal_history`, `list_all_goals`, `create_goal`, `set_goal`, `update_goal_objective`, `update_goal_status`, `update_goal`, and `clear_goal`.
 - Goal close evidence: `complete` requires verified evidence, and `unmet` requires a concrete blocker.
 - Persistent per-session goal state with history, checkpoints, budgets, and owner-only file permissions.
 - Optional automatic continuation on `session.idle` / `session.status`, with no-progress pause and budget wrap-up safeguards.
