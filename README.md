@@ -449,11 +449,21 @@ step on a `github:` or file-path install, so the bundle has to be in the reposit
 
 ## Releases
 
-This fork does not publish to npm; there is no `@sblattj/opencode-goal-plugin` package on the registry,
-and installs come from this repository directly. The `publish.yml` workflow is inherited from upstream
-and still targets npm on every push to `main`. It has never run successfully for this fork and would
-need both an npm package and a Trusted Publisher configured against
-`sblattj/opencode-goal-plugin` before it could — treat it as inactive.
+Releases are cut as [GitHub releases](https://github.com/sblattj/opencode-goal-plugin/releases) and
+described in [`CHANGELOG.md`](CHANGELOG.md). The artifact is the committed, self-contained
+`dist/server.js` — point OpenCode's `plugin` array at it, or at a checkout of the tag you want.
+
+**On version numbers.** This fork carries upstream's full history, so `git tag` in a local clone lists
+upstream's `v0.1.x` tags. None of them were ever releases of *this* repository, and none were pushed
+here — `git ls-remote --tags origin` was empty until `v0.2.0`. **`0.2.0` is this fork's first
+release**, numbered above every inherited tag so the two lines cannot collide or be confused.
+
+This fork does not publish to npm; there is no `@sblattj/opencode-goal-plugin` package on the
+registry, and installs come from this repository directly. The inherited `publish.yml` workflow
+targets npm and is now `workflow_dispatch` only — a push-triggered run could only ever fail. Running
+it would need both an npm package and a Trusted Publisher configured against
+`sblattj/opencode-goal-plugin`; treat it as inactive. Typecheck, lint and tests still run on every
+pull request via `ci.yml`.
 
 ## Report A Bug Or Contribute
 

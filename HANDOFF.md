@@ -104,9 +104,13 @@ unnecessary. `.gitignore`'s `dist/` line only ever suppressed *untracked* files,
 its real effect was to hide future `dist/` changes from `git status`. The line was
 removed anyway — that is the right cleanup.
 
-Note `package.json` says `0.1.1` while upstream's npm package ships `0.1.39` — upstream's published
-version is computed in CI by `scripts/resolve-ci-version.ts`, so the in-repo number was never the
-release number. This fork publishes nothing to npm, so the number is inert. Don't "fix" it.
+Note the version number history. `package.json` said `0.1.1` while upstream's npm package shipped
+`0.1.39`, because upstream's published version is computed in CI by `scripts/resolve-ci-version.ts` —
+the in-repo number was never upstream's release number. **Superseded 2026-08-29:** the fork now cuts
+its own GitHub releases, so the number is no longer inert. It is `0.2.0`, set deliberately above every
+inherited `v0.1.x` tag so the fork's line cannot collide with or be mistaken for upstream's. Those
+inherited tags are local-only — `git ls-remote --tags origin` is empty — and this repository had no
+releases at all before `v0.2.0`. See `CHANGELOG.md`.
 
 ## 4. Point OpenCode at this fork (done on this host)
 
