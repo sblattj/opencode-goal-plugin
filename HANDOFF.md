@@ -284,3 +284,32 @@ tolerates in both directions.
 - The probe model reached first for an **`ask-me` skill** before concluding it could not ask. The
   policy text was broadened to name every route to the user, not just the tool, but a skill that
   asks is not blocked by anything — only discouraged.
+
+---
+
+## 8. The plugin was not loading on this host at all (2026-08-29)
+
+Found while verifying §7 end to end, and it invalidates the "wired up on this host" claim in §6.
+
+**Symptom:** a real `opencode run` under the host's own config reported no `set_goal` tool.
+`opencode debug config` confirmed it: `plugin_origins` listed the plugin, but the `/goal` command
+its `config()` hook registers was **absent** from the resolved config. Against a scratch config
+that pointed at a checkout with `node_modules`, the same command **was** present — that control is
+what makes this a load failure rather than a quirk of the debug output.
+
+**Cause:** `dist/server.js` was built with `--external effect --external zod`, so it imports both as
+bare specifiers and needs a `node_modules` beside it to resolve them. The checkout OpenCode loads
+from had none. The plugin failed to load silently — nothing in `~/.local/share/opencode/log`.
+
+This is also why the §6 confirmation was worthless: it checked the module with `bun -e 'await
+import(...)'`, and bun resolves a missing bare specifier out of its global install cache. It proved
+the file parses, not that OpenCode can load it. **A verification that runs under a more forgiving
+resolver than production is not a verification.**
+
+**Fix:** the build no longer externalises the runtime dependencies, so `dist/server.js` is
+self-contained (1.37 MB, importing only Node builtins). Nothing beside it has to exist. This fork
+is consumed as a local file path and is not published to npm, so there is no consumer who wanted
+those dependencies resolved from a package manifest.
+
+`@opencode-ai/plugin` stays external because it is type-only — it does not appear in the bundle's
+imports at all.
