@@ -3,7 +3,7 @@
 **Repo:** `sblattj/opencode-goal-plugin` (**private**)
 **Upstream:** `prevalentWare/opencode-goal-plugin` (MIT) — kept as the `upstream` git remote
 **Created:** 2026-08-28
-**Status:** repo stood up, upstream history intact, **the fix is NOT applied yet**. That is the next agent's job.
+**Status:** **the fix is APPLIED, built, and shipped to `main`** (`e4adfab`, 2026-08-28), and OpenCode on this host is wired to it. What remains is the optional upstream PR and a live behavioural confirmation — see §6.
 
 This is a **hard fork**, not a GitHub fork: GitHub forks of a public repo cannot be made private, so
 the history was cloned and pushed to a fresh private repo (`isFork=false`). Upstream is still wired
@@ -41,7 +41,7 @@ frozen at 1 across ~9 minutes of real work and logged checkpoints, `lastAssistan
 `continuationBaselineMessageID` (so work *had* happened), ~4.97M tokens used (many compactions), and
 no errors anywhere.
 
-## 2. The fix to apply
+## 2. The fix (applied in `e4adfab`)
 
 Keep the author's intent — native autocontinue stays suppressed — but **guarantee a trigger**, by
 scheduling a `"recovery"` continuation straight from the compaction hook. This mirrors the
@@ -76,7 +76,7 @@ missing `lastContinuationAt` and falls back to a short settle delay.
 `recordAssistantMessage` path. That would disable the legitimate `max_no_progress_turns` auto-pause
 safety feature.
 
-## 3. Build and ship it
+## 3. Build and ship it (done)
 
 ```bash
 bun install
@@ -91,57 +91,94 @@ Bun, Bun does **not** run a build on a `github:` install, and `package.json` map
 `exports["./server"] → ./dist/server.js`. So a `github:` install of this fork resolves to a missing
 file unless the built bundle is in the repo:
 
-```bash
-# drop the `dist/` line from .gitignore, then
-git add -f dist/server.js src/server.ts .gitignore HANDOFF.md
-git commit -m "fix: schedule a recovery continuation after suppressed compaction so active goals keep going"
-git push origin main
-```
+Result on 2026-08-28: `bun test` 213 pass / 0 fail, `tsc --noEmit` clean, `eslint`
+clean, `node --check dist/server.js` clean, and `grep scheduleSettledContinuation
+dist/server.js` shows the scheduled recovery call inside the compiled compaction
+hook. Committed as `e4adfab` on `main`.
+
+**Correction to the paragraph above:** `dist/server.js` was ALREADY tracked in this
+tree (committed upstream in `2aabd27`, `8acc2e4`, `27b8d32`), so the `github:`
+install was never actually resolving to a missing file, and the `git add -f` was
+unnecessary. `.gitignore`'s `dist/` line only ever suppressed *untracked* files, so
+its real effect was to hide future `dist/` changes from `git status`. The line was
+removed anyway — that is the right cleanup.
 
 Note `package.json` says `0.1.1` while npm ships `0.1.39` — the published version is computed in CI
 by `scripts/resolve-ci-version.ts`, so the in-repo number is not the release number. Don't "fix" it.
 
-## 4. Point OpenCode at this fork
+## 4. Point OpenCode at this fork (done on this host)
 
-In the opencode config (`~/.config/opencode/opencode.json`, or wherever `$OPENCODE_CONFIG` points):
+Two things the original version of this section got wrong, both found by
+`opencode debug config` rather than by reasoning:
 
-```jsonc
-"plugin": [
-  "github:sblattj/opencode-goal-plugin"          // default branch
-  // or pin:  "github:sblattj/opencode-goal-plugin#<tag-or-sha>"
-]
+**`github:` does not work for a private repo.** Bun resolves it through an
+unauthenticated GitHub API call:
+
+```
+$ bun add github:sblattj/opencode-goal-plugin
+error: GET https://api.github.com/repos/sblattj/opencode-goal-plugin/tarball/ - 404
+error: github:sblattj/opencode-goal-plugin failed to resolve
 ```
 
-A private repo needs Bun to be able to authenticate to GitHub — if the install fails, either make
-the install use a token Bun can see, or fall back to the **local path** form, which is also the
-fastest way to iterate:
+So the local-path form is the one in use — which is also the fastest way to
+iterate:
 
 ```jsonc
 "plugin": ["/Users/<you>/code/opencode-goal-plugin/dist/server.js"]
 ```
 
-Restart OpenCode fully, then prove the patched copy is the one loaded:
+**OpenCode MERGES its config files, and for an array key it concatenates.** On
+this host `$OPENCODE_CONFIG` points at `~/.dotai/adapters/opencode/opencode.jsonc`,
+but `~/.config/opencode/opencode.json` also carried a `plugin` entry, and the
+resolved config contained BOTH — the patched fork *and* the unpatched npm package,
+two copies of the same plugin. Changing only one file is not enough. Check the
+resolved value, never the file you edited:
 
 ```bash
-grep -rn 'scheduleSettledContinuation(input.sessionID' ~/.cache/opencode/packages/**/opencode-goal-plugin*/**/dist/server.js
+opencode debug config | python3 -c "import json,sys; print(json.load(sys.stdin)['plugin'])"
+# -> ['file:///Users/<you>/code/opencode-goal-plugin/dist/server.js']    # exactly one entry
 ```
-
-**Verify the behaviour, not just the bytes:** start a goal, let the context grow until compaction
-fires, and confirm `autoTurns` keeps incrementing in `~/.local/share/opencode-goal-plugin/goals.json`.
 
 ## 5. Two loose ends
 
-- **A temporary hotfix may still be applied to the cache** at
-  `~/.cache/opencode/packages/@prevalentware/opencode-goal-plugin@latest/node_modules/@prevalentware/opencode-goal-plugin/dist/server.js`.
-  It is overwritten whenever OpenCode refreshes the plugin cache — which is the whole reason this
-  fork exists. Once the fork is wired in, that hotfix is redundant.
-- **Upstream PR (optional, good citizenship):** the fix belongs upstream so the fork can eventually
+- **The temporary cache hotfix is already gone.** Checked 2026-08-28: the cached bundle
+  (`~/.cache/opencode/packages/@prevalentware/opencode-goal-plugin@latest/.../dist/server.js`,
+  mtime Aug 24) has the *unpatched* hook — `output.enabled = false` and nothing else. A cache
+  refresh ate the hotfix, which is precisely the failure mode this fork exists to escape.
+  Nothing to clean up.
+- **Upstream PR — still open, deliberately.** The fix belongs upstream so the fork can eventually
   be dropped. Suggested title: *"Active goals stop auto-continuing after auto-compaction (native
-  autocontinue suppressed, no idle trigger)."* Include the §1 evidence.
+  autocontinue suppressed, no idle trigger)."* Include the §1 evidence. Not opened here because
+  a PR against a third-party public repo is an outward-facing act that is the repo owner's call,
+  not an agent's.
 
 Unrelated housekeeping seen on the same machine: `~/.local/share/opencode-goal-plugin/` accumulates
 orphaned `goals.json.*.tmp` files (atomic-writer temps left by hard-killed processes sharing one
-global `goals.json`). `find ~/.local/share/opencode-goal-plugin -name 'goals.json.*.tmp' -delete`.
+global `goals.json`). `find ~/.local/share/opencode-goal-plugin -name 'goals.json.*.tmp' -delete`
+— run 2026-08-28, removed 0 files; the directory holds only `goals.json`.
+
+## 6. What is left
+
+1. **Behavioural confirmation.** Everything so far proves the patched bundle is the
+   one OpenCode resolves and that it imports cleanly with the compaction hook present
+   (`bun -e` import shows `{id, server, setup}`, `id: local.goal-mode.server`, and the
+   hook in the v1 `server` source). What has NOT been observed is a real goal surviving
+   a real compaction. To close it: start a goal, let context grow until compaction fires,
+   and confirm `autoTurns` keeps incrementing in
+   `~/.local/share/opencode-goal-plugin/goals.json`.
+2. **The upstream PR**, per §5.
+
+### Scope note the original handoff missed: v1 vs v2
+
+`src/server.ts` exports two implementations — `export default { id, server, setup: setupV2 }`.
+`"experimental.compaction.autocontinue"` is registered **only** in the v1 `server`
+(`src/server.ts:919-1537`); `setupV2` (1547-2196) registers tool/session hooks and an event
+subscription and never registers a compaction hook, so there is no equivalent bug there.
+Which one runs matters, and it resolves cleanly: the package's runtime dependency is
+`@opencode-ai/plugin ^1.17.1` and the host runs OpenCode **1.18.23**, while `setupV2` is
+written against `@opencode-ai/plugin-v2` — a `0.0.0-next-17055` prerelease kept only as a
+devDependency. The v1 path is the live one, which also matches the original bug report
+("does not keep working after compaction in opencode v1").
 
 ---
 
@@ -149,7 +186,7 @@ global `goals.json`). `find ~/.local/share/opencode-goal-plugin -name 'goals.jso
 |---|---|
 | This repo | `sblattj/opencode-goal-plugin` (private, hard fork) |
 | Upstream | `prevalentWare/opencode-goal-plugin` (MIT), remote `upstream` |
-| File to edit | `src/server.ts` — hook at **1422-1425** |
+| File edited | `src/server.ts` — hook at **1422-1425** (v1 `server` export only) |
 | Build | `bun run build` → `dist/server.js` (must be committed here) |
-| Wire-up | `plugin: ["github:sblattj/opencode-goal-plugin"]` |
+| Wire-up | local path — `github:` cannot resolve a private repo under Bun |
 | State file | `~/.local/share/opencode-goal-plugin/goals.json` |
