@@ -31,7 +31,11 @@
     "Prevalentware (original author of prevalentWare/opencode-goal-plugin)"
   ],
   "type": "module",
+  "main": "./dist/server.js",
   "exports": {
+    ".": {
+      "import": "./dist/server.js"
+    },
     "./server": {
       "import": "./dist/server.js"
     },
@@ -43,7 +47,8 @@
     "dist",
     "src/tui.ts",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "clean": "rm -rf dist",

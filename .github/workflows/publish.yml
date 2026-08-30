@@ -1,11 +1,23 @@
 name: Publish
 
-# Manual only. This fork is not published to npm: the package is
-# @sblattj/opencode-goal-plugin, which has no npm package and no Trusted
-# Publisher, so a push-triggered run could only ever fail. Typecheck, lint and
-# unit tests still run on every push via ci.yml. Re-add the push trigger if the
-# scope is ever claimed on npm.
+# Publishes @sblattj/opencode-goal-plugin to npm on v* tags via OIDC trusted
+# publishing. Prerequisites, in order (npm cannot register a trusted publisher
+# for a package name that does not exist yet):
+#
+#   1. The FIRST publish of a new package name is manual, from a logged-in
+#      terminal: `npm publish --access public` (publishConfig already forces
+#      public). No provenance on that first cut.
+#   2. Then register the trusted publisher at npmjs.com -> package Settings ->
+#      Trusted Publisher: repository sblattj/opencode-goal-plugin, workflow
+#      publish.yml, no environment.
+#   3. Every later v* tag then publishes from CI with provenance.
+#
+# The skip-if-exists guard keeps a tag run green when the version was already
+# published manually (or the run is re-triggered). Typecheck, lint and unit
+# tests still run on every pull request via ci.yml.
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -55,10 +67,6 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run ci:version
@@ -69,14 +77,32 @@ jobs:
           PKG_NAME=$(node -p "require('./package.json').name")
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+      - name: Skip if this version is already on npm
+        id: exists
+        run: |
+          if npm view "${{ steps.version.outputs.name }}@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
       - run: bun run build
-      - run: npm publish --ignore-scripts
-      - name: Create GitHub release
+        if: steps.exists.outputs.skip != 'true'
+      # OIDC trusted publishing needs npm >= 11.5.1 on the runner.
+      - run: npm install --global npm@latest
+        if: steps.exists.outputs.skip != 'true'
+      - run: npm publish --ignore-scripts --provenance --access public
+        if: steps.exists.outputs.skip != 'true'
+      - name: Create GitHub release (idempotent)
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
           PKG_NAME: ${{ steps.version.outputs.name }}
         run: |
+          if gh release view "v${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release v${VERSION} already exists; skipping creation."
+            exit 0
+          fi
           cat > release-notes.md <<EOF
           Published npm version: ${PKG_NAME}@${VERSION}
 
