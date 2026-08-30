@@ -86,7 +86,9 @@ test("server plugin exposes Codex-style goal tools", async () => {
     "get_goal_history",
     "list_all_goals",
     "set_goal",
+    "snapshot_goal",
     "update_goal",
+    "update_goal_limits",
     "update_goal_objective",
     "update_goal_status",
   ])
@@ -3386,4 +3388,130 @@ test("the README lists exactly the tools the plugin registers", async () => {
   const documented = [...line.matchAll(/`([a-z_]+)`/g)].map((match) => match[1]!).sort()
 
   expect(documented).toEqual(registered)
+})
+
+test("the v1 limit tools recover a duration-limited goal without clearing it", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_1", agent: "build" } as never
+
+  const start = new Date("2026-08-30T00:00:00.000Z")
+  setSystemTime(start)
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "run the long-haul pipeline", token_budget: 300_000_000, max_duration_seconds: 36_000 },
+    context,
+  )
+  setSystemTime(new Date(start.getTime() + 42_478 * 1000))
+  await reserveContinuation("ses_1", 100, 0)
+  setSystemTime()
+
+  // A resume with no added runway is refused, and says exactly why.
+  const refused = JSON.parse(
+    String(await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "active" }, context)),
+  )
+  expect(refused.goal.status).toBe("usageLimited")
+  expect(refused.resume_refused).toBe(true)
+  expect(refused.limited_by).toBe("duration")
+  expect(refused.exhausted_limits).toEqual([{ kind: "duration", used: 42_478, cap: 36_000 }])
+  expect(refused.remediation).toContain("update_goal_limits")
+
+  // Raising the cap in place reports that a resume is now available.
+  const raised = JSON.parse(
+    String(
+      await requireTool(tools.update_goal_limits, "update_goal_limits").execute({ additional_seconds: 3_600 }, context),
+    ),
+  )
+  expect(raised.limits_updated).toBe(true)
+  expect(raised.resume_available).toBe(true)
+  expect(raised.goal.maxDurationSeconds).toBe(42_478 + 3_600)
+  expect(raised.goal.status).toBe("usageLimited")
+
+  const resumed = JSON.parse(
+    String(await requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "active" }, context)),
+  )
+  expect(resumed.goal.status).toBe("active")
+  expect(resumed.resume_refused).toBeUndefined()
+  // The goal was never recreated: history and creation time survived.
+  expect(resumed.goal.createdAt).toBe(refused.goal.createdAt)
+  expect(resumed.goal.history.length).toBeGreaterThan(refused.goal.history.length)
+})
+
+test("update_goal_status resumes with an increment in a single call", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool!
+  const context = { sessionID: "ses_1", agent: "build" } as never
+
+  const start = new Date("2026-08-30T00:00:00.000Z")
+  setSystemTime(start)
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "long haul", max_duration_seconds: 60 },
+    context,
+  )
+  setSystemTime(new Date(start.getTime() + 600 * 1000))
+  await reserveContinuation("ses_1", 100, 0)
+  setSystemTime()
+
+  const resumed = JSON.parse(
+    String(
+      await requireTool(tools.update_goal_status, "update_goal_status").execute(
+        { status: "active", additional_seconds: 1_800 },
+        context,
+      ),
+    ),
+  )
+  expect(resumed.goal.status).toBe("active")
+  expect(resumed.goal.maxDurationSeconds).toBe(600 + 1_800)
+  expect(resumed.resume_refused).toBeUndefined()
+})
+
+test("snapshot_goal exports the goal as markdown without mutating it", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool!
+  const context = { sessionID: "ses_1", agent: "build" } as never
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "EXPORT_ME verbatim", token_budget: 500 },
+    context,
+  )
+  const before = await getGoal("ses_1")
+
+  const result = JSON.parse(String(await requireTool(tools.snapshot_goal, "snapshot_goal").execute({}, context)))
+
+  expect(result.markdown).toContain("# Goal snapshot")
+  expect(result.markdown).toContain("EXPORT_ME verbatim")
+  expect(result.markdown).toContain("| Token budget | 500 |")
+  const after = await getGoal("ses_1")
+  expect(after?.updatedAt).toBe(before!.updatedAt)
+  expect(after?.history).toEqual(before!.history)
+})
+
+test("update_goal_limits refuses to resume a plan-mode goal by raising limits", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool!
+  const planContext = { sessionID: "ses_1", agent: "plan" } as never
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "planned work", max_duration_seconds: 60 },
+    planContext,
+  )
+
+  // Raising limits must not become a back door around the Plan-mode gate.
+  const raised = JSON.parse(
+    String(await requireTool(tools.update_goal_limits, "update_goal_limits").execute({ additional_seconds: 60 }, planContext)),
+  )
+  expect(raised.goal.status).toBe("paused")
+  await expect(
+    requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "active" }, planContext),
+  ).rejects.toThrow("Plan mode")
 })

@@ -25,7 +25,7 @@ The OpenCode Goal Plugin adds:
 
 - `/goal <objective>` as an OpenCode command for TUI, desktop, and web.
 - A sidebar goal indicator with status, elapsed time, and objective.
-- Agent tools: `get_goal`, `get_goal_history`, `list_all_goals`, `create_goal`, `set_goal`, `update_goal_objective`, `update_goal_status`, `update_goal`, and `clear_goal`.
+- Agent tools: `get_goal`, `get_goal_history`, `list_all_goals`, `snapshot_goal`, `create_goal`, `set_goal`, `update_goal_objective`, `update_goal_limits`, `update_goal_status`, `update_goal`, and `clear_goal`.
 - Goal close evidence: `complete` requires verified evidence, and `unmet` requires a concrete blocker.
 - Persistent per-session goal state with history, checkpoints, budgets, and owner-only file permissions.
 - Optional automatic continuation on `session.idle` / `session.status`, with no-progress pause and budget wrap-up safeguards.
@@ -339,6 +339,53 @@ The plugin also uses safety states while keeping the goal available for review o
 - `paused` when the user pauses, auto-continue repeatedly fails, or repeated low-progress goal continuation turns are detected. No-progress accounting is scoped to goal continuation turns: each reserved continuation is evaluated once, when its turn completes, and unrelated assistant activity in the session never pauses the goal.
 
 When a safety limit is reached, the plugin sends one wrap-up prompt asking for a concise handoff instead of silently continuing forever.
+
+### Extending A Goal That Hit A Limit
+
+A safety limit is adjustable, not terminal. `update_goal_limits` edits a non-closed
+goal's limits in place, keeping its `history`, `checkpoints`, `createdAt`, and
+elapsed accounting — the four things `clear_goal` + `create_goal` throws away.
+
+Each limit takes **either** an absolute value **or** an increment, never both in
+one call:
+
+| Argument | Effect |
+| --- | --- |
+| `max_duration_seconds`, `token_budget`, `max_auto_turns` | Set the cap absolutely. `null` removes the cap entirely. |
+| `additional_seconds`, `additional_tokens`, `additional_auto_turns` | Raise the cap by that much above **whichever is larger, the cap or the amount already used**. |
+| `reset_elapsed` | Opt-in. Zeroes the elapsed clock so the goal starts a fresh one. |
+
+The increment anchors on usage rather than on the cap because an overrun goal is
+the normal case. A goal stopped at 42478s elapsed against a 36000s cap gains
+nothing from `36000 + 3600`; the result is still below the elapsed value and the
+goal re-limits on the next continuation. Anchoring on the larger of the two always
+buys the full runway asked for.
+
+`update_goal_status` accepts the same three increments, so raising a cap and
+resuming is one call:
+
+```jsonc
+// Refused: elapsed already exceeds the cap, so resuming would re-limit at once.
+{ "status": "active" }
+// → { "resume_refused": true, "limited_by": "duration",
+//     "exhausted_limits": [{ "kind": "duration", "used": 42478, "cap": 36000 }] }
+
+// Buys 2h of runway and resumes in the same call.
+{ "status": "active", "additional_seconds": 7200 }
+```
+
+Resuming a goal whose limit is already exhausted is **refused** rather than
+accepted-then-reverted. Earlier versions flipped the goal to `active` for one
+instant and re-limited on the next continuation, which reported a resume that
+never happened. Every goal snapshot now carries `exhaustedLimits`, `limitKind`,
+and `remainingSeconds` so the exhausted cap can be identified without parsing
+`stopReason`. `limitKind` is derived on read and never persisted: `status` stays
+the same six values it has always been, so a state file written by this version
+still loads in an older plugin.
+
+`snapshot_goal` exports the whole goal as markdown — the objective verbatim, plus
+limits, usage, checkpoints, and full history — for preserving state before any
+destructive change.
 
 ## Questions While A Goal Is Active
 

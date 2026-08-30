@@ -14,6 +14,54 @@ The fork is consumed as a local file path and is **not published to npm**. There
 is no `@sblattj/opencode-goal-plugin` package; `dist/server.js` is committed and
 self-contained, and that file is the artifact.
 
+## [0.3.0] — 2026-08-30
+
+Hitting a wall-clock limit used to be functionally the same as losing the goal.
+A goal capped at 36000s that ran to 42478s elapsed — with 98% of its 300M token
+budget still unspent — could not be given more runway by any tool: `update_goal_status`
+could not grant time, `update_goal_objective` edited only the objective text, and
+`update_goal` only closed the goal. The single workaround was `clear_goal` +
+`create_goal`, which discards `history[]`, `checkpoints[]`, and elapsed accounting
+and forces the entire objective to be re-passed verbatim.
+
+### Added
+
+- **`update_goal_limits`** edits a non-closed goal's `maxDurationSeconds`,
+  `tokenBudget`, and `maxAutoTurns` in place, preserving `history[]`,
+  `checkpoints[]`, `createdAt`, and elapsed accounting. Each limit takes either an
+  absolute value (`null` clears the cap) or an increment; passing both for one
+  limit is rejected rather than silently resolved.
+- **Resume-with-increment.** `update_goal_status` accepts `additional_seconds`,
+  `additional_tokens`, and `additional_auto_turns`, so raising a cap and resuming
+  is one atomic call instead of two. An increment anchors on whichever is larger,
+  the cap or the amount already used: `36000 + 3600` would still sit below 42478s
+  elapsed and re-limit immediately, so the anchor has to be the usage.
+- **`snapshot_goal`** exports a goal as markdown — the objective verbatim, plus
+  limits, usage, checkpoints, and full history — so state can be preserved before
+  any destructive change without hand-rolling a file.
+- **`reset_elapsed`** (opt-in, on both tools) zeroes the elapsed clock for the
+  "same goal, fresh clock" case.
+- Goal snapshots carry `exhaustedLimits`, `limitKind`, and `remainingSeconds`, so
+  a caller can tell a duration-limited goal from a token-limited one without
+  parsing `stopReason`. These are derived on read and never persisted: `GoalStatus`
+  is a persisted `Schema.Literal`, and adding a status value there would make a
+  new state file undecodable by an older plugin — which fails the whole file, not
+  just the new goal.
+
+### Fixed
+
+- **Resuming an exhausted goal reported a resume that never happened.**
+  `update_goal_status { status: "active" }` on a goal past its duration cap set the
+  status to `active`, returned success, and then re-limited on the very next
+  continuation, because elapsed time still exceeded the cap. The resume is now
+  refused up front: the goal keeps its limited status and the result carries
+  `resume_refused`, `limited_by`, and the exhausted limits with their real numbers.
+- **Limit messages named the cap but not the overrun.** A stop reason read
+  `max duration reached (36000s)` with no indication that 42478s had elapsed.
+  Stop reasons now read `elapsed 42478s >= duration cap 36000s`, and both the
+  wrap-up prompt and the tool results state the remediation — raise the limit,
+  do not clear and recreate the goal.
+
 ## [0.2.1] — 2026-08-29
 
 ### Fixed

@@ -3,7 +3,7 @@ import type * as PluginV2 from "@opencode-ai/plugin-v2"
 import type { Info as ToolV2Info } from "@opencode-ai/plugin-v2/promise/tool"
 import type { Tool as ToolSchema } from "@opencode-ai/schema/tool"
 import { z } from "zod"
-import type { GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state"
+import type { GoalLimitInput, GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state"
 import {
   accountUsage,
   clearGoal,
@@ -11,6 +11,7 @@ import {
   createGoal,
   estimateTokensFromText,
   formatGoalHistory,
+  formatGoalSnapshotMarkdown,
   getAllGoals,
   getGoal,
   getGoalInternal,
@@ -26,6 +27,7 @@ import {
   reserveContinuation,
   rollbackContinuationAttempt,
   setGoalStatus,
+  updateGoalLimits,
   updateGoalObjective,
   validateObjective,
 } from "./state"
@@ -76,6 +78,24 @@ type UpdateGoalArgs =
       blocker?: string
     }
 
+type UpdateGoalStatusArgs = {
+  status: "active" | "paused"
+  additional_seconds?: number | null
+  additional_tokens?: number | null
+  additional_auto_turns?: number | null
+  reset_elapsed?: boolean
+}
+
+type UpdateGoalLimitsArgs = {
+  token_budget?: number | null
+  max_auto_turns?: number | null
+  max_duration_seconds?: number | null
+  additional_tokens?: number | null
+  additional_seconds?: number | null
+  additional_auto_turns?: number | null
+  reset_elapsed?: boolean
+}
+
 const DEFAULT_MAX_AUTO_TURNS = 25
 const DEFAULT_CONTINUE_INTERVAL_SECONDS = 3
 const DEFAULT_MAX_PROMPT_FAILURES = 3
@@ -89,7 +109,7 @@ const RETRY_SETTLE_MS = 25
 const TRANSPORT_ERROR_PATTERN =
   /\b(?:network|fetch|socket|connect|connection|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|transport|stream|websocket|offline|internet|request failed|proxy)\b/i
 const NON_TRANSPORT_TERMINAL_PATTERN = /\b(?:abort(?:ed)?|interrupt(?:ed|ion)?)\b/i
-const NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals"])
+const NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals", "snapshot_goal"])
 // OpenCode's built-in tool for asking the user questions mid-turn. It is the
 // one tool that can stall an unattended goal indefinitely, because it waits
 // on a human who is not watching the terminal.
@@ -120,7 +140,11 @@ const TASK_TERMINAL_STATES = new Set<TaskState>(["completed", "error", "cancelle
 const PLAN_MODE_CREATE_NOTICE =
   'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.'
 const LIMITED_GOAL_NOTICE =
-  "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, remaining work, and blockers, then wait for the user to resume or edit the goal."
+  "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, remaining work, and blockers, then wait for the user to resume or edit the goal. If the user asks to continue, raise the exhausted limit with update_goal_limits (or resume with additional_seconds / additional_tokens) rather than clearing and recreating the goal, which discards its history and checkpoints."
+const RESUME_REMEDIATION_NOTICE =
+  "The goal was not resumed: a limit is already exhausted, so resuming would re-limit immediately. Raise the exhausted cap first with update_goal_limits, or retry update_goal_status with the matching additional_seconds, additional_tokens, or additional_auto_turns. Do not clear and recreate the goal to work around this; that discards history, checkpoints, and elapsed accounting."
+const RESUME_AVAILABLE_NOTICE =
+  "Limits raised and the goal now has runway, but it is still in its limited status. Call update_goal_status with status active to actually resume it."
 const DUPLICATE_GOAL_NOTICE =
   "This non-closed goal already exists. Do not call create_goal or set_goal again. The existing objective and limits were preserved; repeated-call arguments were not applied. Use the returned goal state and continue only when its status permits execution."
 const CONFLICTING_GOAL_NOTICE =
@@ -918,18 +942,65 @@ async function closeGoalFromTool(input: UpdateGoalArgs, context: ToolExecContext
   return JSON.stringify({ goal, unmet_report: report }, null, 2)
 }
 
-async function updateGoalStatusFromTool(
-  input: { status: "active" | "paused" },
-  context: ToolExecContext,
-  services: GoalServices,
-) {
+// A resume that lands back on a limited status did not resume. Saying so in the
+// tool result — with the numbers and the exact remediation — is the difference
+// between "the goal is unrecoverable" and "raise the cap and try again".
+function resumeDiagnostics(goal: GoalSnapshot, requested: "active" | "paused") {
+  if (requested !== "active" || goal.exhaustedLimits.length === 0) return {}
+  return {
+    resume_refused: true,
+    limited_by: goal.limitKind,
+    exhausted_limits: goal.exhaustedLimits,
+    remediation: RESUME_REMEDIATION_NOTICE,
+  }
+}
+
+async function updateGoalStatusFromTool(input: UpdateGoalStatusArgs, context: ToolExecContext, services: GoalServices) {
   if (input.status === "active" && services.isPlanAgent(context.agent)) {
     throw new Error(
       "cannot resume the goal while the session is in Plan mode; ask the user to switch to Build mode and resume the goal from there",
     )
   }
-  const goal = await setGoalStatus(context.sessionID, input.status, typeof context.agent === "string" ? context.agent : null)
-  return JSON.stringify({ goal }, null, 2)
+  const goal = await setGoalStatus(context.sessionID, input.status, typeof context.agent === "string" ? context.agent : null, {
+    additionalSeconds: input.additional_seconds ?? null,
+    additionalTokens: input.additional_tokens ?? null,
+    additionalAutoTurns: input.additional_auto_turns ?? null,
+    resetElapsed: input.reset_elapsed === true,
+  })
+  return JSON.stringify({ goal, ...resumeDiagnostics(goal, input.status) }, null, 2)
+}
+
+async function updateGoalLimitsFromTool(input: UpdateGoalLimitsArgs, context: ToolExecContext) {
+  // Key presence is the signal for an absolute set, so only forward the keys the
+  // caller actually sent: spreading undefined would read as "clear this cap".
+  const limits: GoalLimitInput = {}
+  if (input.token_budget !== undefined) limits.tokenBudget = input.token_budget
+  if (input.max_auto_turns !== undefined) limits.maxAutoTurns = input.max_auto_turns
+  if (input.max_duration_seconds !== undefined) limits.maxDurationSeconds = input.max_duration_seconds
+  if (input.additional_tokens != null) limits.additionalTokens = input.additional_tokens
+  if (input.additional_seconds != null) limits.additionalSeconds = input.additional_seconds
+  if (input.additional_auto_turns != null) limits.additionalAutoTurns = input.additional_auto_turns
+  if (input.reset_elapsed === true) limits.resetElapsed = true
+
+  const goal = await updateGoalLimits(context.sessionID, limits)
+  const resumable = goal.exhaustedLimits.length === 0 && (goal.status === "usageLimited" || goal.status === "budgetLimited")
+  return JSON.stringify(
+    {
+      goal,
+      limits_updated: true,
+      ...(resumable ? { resume_available: true, resume_notice: RESUME_AVAILABLE_NOTICE } : {}),
+      ...(goal.exhaustedLimits.length > 0
+        ? { still_exhausted: goal.exhaustedLimits, remediation: RESUME_REMEDIATION_NOTICE }
+        : {}),
+    },
+    null,
+    2,
+  )
+}
+
+async function snapshotGoalFromTool(context: ToolExecContext) {
+  const goal = await getGoal(context.sessionID)
+  return JSON.stringify({ goal, markdown: formatGoalSnapshotMarkdown(goal) }, null, 2)
 }
 
 function v2ObjectSchema(properties: Record<string, unknown>, required: string[] = []): ToolSchema.ValueSchema {
@@ -1407,12 +1478,100 @@ const server: Plugin = async ({ client }, options?: Options) => {
       },
       update_goal_status: {
         description:
-          "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not allowed while the session is in Plan mode; the user must switch to Build mode first.",
+          "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not allowed while the session is in Plan mode; the user must switch to Build mode first. Resuming a goal whose limit is already exhausted is refused and returns resume_refused with the exhausted limits; pass the matching additional_seconds, additional_tokens, or additional_auto_turns to buy runway and resume in one call.",
         args: {
           status: z.enum(["active", "paused"]).describe("active resumes a goal; paused pauses it without clearing it."),
+          additional_seconds: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("Extra wall-clock seconds to add to the duration cap before resuming."),
+          additional_tokens: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("Extra tokens to add to the token budget before resuming."),
+          additional_auto_turns: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("Extra auto-continues to add to the auto-continue cap before resuming."),
+          reset_elapsed: z
+            .boolean()
+            .optional()
+            .describe("Opt-in: zero the elapsed-time accounting so the goal restarts its clock. Only use when the user asks."),
         },
         async execute(args, context) {
-          return updateGoalStatusFromTool(args as { status: "active" | "paused" }, context, goalServices)
+          return updateGoalStatusFromTool(args as UpdateGoalStatusArgs, context, goalServices)
+        },
+      },
+      update_goal_limits: {
+        description:
+          "Raise, lower, or clear the current OpenCode goal's limits in place, preserving its history, checkpoints, and elapsed accounting. Use this instead of clear_goal plus create_goal whenever a goal has stopped at a safety limit and the user wants it to continue. Each limit takes either an absolute value or an increment, never both.",
+        args: {
+          token_budget: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("New absolute token budget; null removes the budget."),
+          max_auto_turns: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("New absolute auto-continue limit; null removes the limit."),
+          max_duration_seconds: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("New absolute duration limit in seconds; null removes the limit."),
+          additional_tokens: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("Raise the token budget by this many tokens above whichever is larger, the cap or the tokens used."),
+          additional_seconds: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("Raise the duration limit by this many seconds above whichever is larger, the cap or the elapsed time."),
+          additional_auto_turns: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("Raise the auto-continue limit by this many turns above whichever is larger, the cap or the turns used."),
+          reset_elapsed: z
+            .boolean()
+            .optional()
+            .describe("Opt-in: zero the elapsed-time accounting so the goal restarts its clock. Only use when the user asks."),
+        },
+        async execute(args, context) {
+          return updateGoalLimitsFromTool(args as UpdateGoalLimitsArgs, context)
+        },
+      },
+      snapshot_goal: {
+        description:
+          "Export the full current goal as markdown, including the verbatim objective, limits, usage, checkpoints, and history. Use this to preserve a goal's state before any destructive change.",
+        args: {},
+        async execute(_args, context) {
+          return snapshotGoalFromTool(context)
         },
       },
       clear_goal: {
@@ -2445,7 +2604,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
     {
       name: "update_goal_status",
       description:
-        "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not allowed while the session is in Plan mode; the user must switch to Build mode first.",
+        "Pause or resume the current OpenCode goal when the user explicitly asks to pause or resume it. Resuming is not allowed while the session is in Plan mode; the user must switch to Build mode first. Resuming a goal whose limit is already exhausted is refused and returns resume_refused with the exhausted limits; pass the matching additional_seconds, additional_tokens, or additional_auto_turns to buy runway and resume in one call.",
       input: v2ObjectSchema(
         {
           status: {
@@ -2453,12 +2612,86 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
             enum: ["active", "paused"],
             description: "active resumes a goal; paused pauses it without clearing it.",
           },
+          additional_seconds: {
+            type: ["integer", "null"],
+            minimum: 1,
+            description: "Extra wall-clock seconds to add to the duration cap before resuming.",
+          },
+          additional_tokens: {
+            type: ["integer", "null"],
+            minimum: 1,
+            description: "Extra tokens to add to the token budget before resuming.",
+          },
+          additional_auto_turns: {
+            type: ["integer", "null"],
+            minimum: 1,
+            description: "Extra auto-continues to add to the auto-continue cap before resuming.",
+          },
+          reset_elapsed: {
+            type: "boolean",
+            description: "Opt-in: zero the elapsed-time accounting so the goal restarts its clock. Only use when the user asks.",
+          },
         },
         ["status"],
       ),
       options: { codemode: false },
       execute: async (args, toolContext) => ({
-        content: await updateGoalStatusFromTool(args as { status: "active" | "paused" }, toolContext, services),
+        content: await updateGoalStatusFromTool(args as UpdateGoalStatusArgs, toolContext, services),
+      }),
+    },
+    {
+      name: "update_goal_limits",
+      description:
+        "Raise, lower, or clear the current OpenCode goal's limits in place, preserving its history, checkpoints, and elapsed accounting. Use this instead of clear_goal plus create_goal whenever a goal has stopped at a safety limit and the user wants it to continue. Each limit takes either an absolute value or an increment, never both.",
+      input: v2ObjectSchema({
+        token_budget: {
+          type: ["integer", "null"],
+          minimum: 1,
+          description: "New absolute token budget; null removes the budget.",
+        },
+        max_auto_turns: {
+          type: ["integer", "null"],
+          minimum: 1,
+          description: "New absolute auto-continue limit; null removes the limit.",
+        },
+        max_duration_seconds: {
+          type: ["integer", "null"],
+          minimum: 1,
+          description: "New absolute duration limit in seconds; null removes the limit.",
+        },
+        additional_tokens: {
+          type: ["integer", "null"],
+          minimum: 1,
+          description: "Raise the token budget by this many tokens above whichever is larger, the cap or the tokens used.",
+        },
+        additional_seconds: {
+          type: ["integer", "null"],
+          minimum: 1,
+          description: "Raise the duration limit by this many seconds above whichever is larger, the cap or the elapsed time.",
+        },
+        additional_auto_turns: {
+          type: ["integer", "null"],
+          minimum: 1,
+          description: "Raise the auto-continue limit by this many turns above whichever is larger, the cap or the turns used.",
+        },
+        reset_elapsed: {
+          type: "boolean",
+          description: "Opt-in: zero the elapsed-time accounting so the goal restarts its clock. Only use when the user asks.",
+        },
+      }),
+      options: { codemode: false },
+      execute: async (args, toolContext) => ({
+        content: await updateGoalLimitsFromTool(args as UpdateGoalLimitsArgs, toolContext),
+      }),
+    },
+    {
+      name: "snapshot_goal",
+      description:
+        "Export the full current goal as markdown, including the verbatim objective, limits, usage, checkpoints, and history. Use this to preserve a goal's state before any destructive change.",
+      input: v2ObjectSchema({}),
+      options: { codemode: false },
+      execute: async (_args, toolContext) => ({
+        content: await snapshotGoalFromTool(toolContext),
       }),
     },
     {

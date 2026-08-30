@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -13,7 +13,9 @@ const TOOL_NAMES = [
   "get_goal_history",
   "list_all_goals",
   "set_goal",
+  "snapshot_goal",
   "update_goal",
+  "update_goal_limits",
   "update_goal_objective",
   "update_goal_status",
 ].sort()
@@ -1476,6 +1478,76 @@ test("V2 blocking a question increments the goal's questionsSuppressed counter",
   const history = contentOf(await goalTool(mock, "get_goal_history").execute({}, toolContext()))
   expect(history).toContain("Question tool blocked by goal policy: Ship it now?")
   expect(history).toContain("Question tool blocked by goal policy: Really ship it?")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 update_goal_limits and snapshot_goal recover a limited goal through the V2 registry", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+
+  const start = new Date("2026-08-30T00:00:00.000Z")
+  setSystemTime(start)
+  await goalTool(mock, "create_goal").execute(
+    { objective: "run the long-haul pipeline", token_budget: 300_000_000, max_duration_seconds: 36_000 },
+    toolContext(),
+  )
+  setSystemTime(new Date(start.getTime() + 42_478 * 1000))
+  await reserveContinuation("ses_v2", 100, 0)
+  setSystemTime()
+
+  const refused = JSON.parse(
+    contentOf(await goalTool(mock, "update_goal_status").execute({ status: "active" }, toolContext())),
+  )
+  expect(refused.goal.status).toBe("usageLimited")
+  expect(refused.resume_refused).toBe(true)
+  expect(refused.limited_by).toBe("duration")
+
+  const raised = JSON.parse(
+    contentOf(await goalTool(mock, "update_goal_limits").execute({ additional_seconds: 3_600 }, toolContext())),
+  )
+  expect(raised.limits_updated).toBe(true)
+  expect(raised.goal.maxDurationSeconds).toBe(42_478 + 3_600)
+
+  const resumed = JSON.parse(
+    contentOf(await goalTool(mock, "update_goal_status").execute({ status: "active" }, toolContext())),
+  )
+  expect(resumed.goal.status).toBe("active")
+  expect(resumed.goal.createdAt).toBe(refused.goal.createdAt)
+
+  const exported = JSON.parse(contentOf(await goalTool(mock, "snapshot_goal").execute({}, toolContext())))
+  expect(exported.markdown).toContain("# Goal snapshot")
+  expect(exported.markdown).toContain("run the long-haul pipeline")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 update_goal_limits declares every documented argument in its JSON Schema", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+
+  // The V1 zod args and the V2 JSON Schema are written separately, so they can
+  // silently drift; this pins the V2 half to the same argument set.
+  const limits = goalTool(mock, "update_goal_limits").input as { properties: Record<string, unknown> }
+  expect(Object.keys(limits.properties).sort()).toEqual([
+    "additional_auto_turns",
+    "additional_seconds",
+    "additional_tokens",
+    "max_auto_turns",
+    "max_duration_seconds",
+    "reset_elapsed",
+    "token_budget",
+  ])
+  const status = goalTool(mock, "update_goal_status").input as { properties: Record<string, unknown> }
+  expect(Object.keys(status.properties).sort()).toEqual([
+    "additional_auto_turns",
+    "additional_seconds",
+    "additional_tokens",
+    "reset_elapsed",
+    "status",
+  ])
 
   mock.stream.end()
   await cleanup()

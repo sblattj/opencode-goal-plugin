@@ -25,6 +25,8 @@ import {
   setGoalStatus,
   recordSuppressedQuestion,
   snapshot,
+  formatGoalSnapshotMarkdown,
+  updateGoalLimits,
   updateGoalObjective,
 } from "../src/state"
 
@@ -1118,4 +1120,208 @@ test("formatGoal renders the suppressed-question count once it is above zero", a
   expect(rendered).toContain("Questions suppressed: 2")
   expect(rendered.match(/^Questions suppressed: /gm)).toHaveLength(1)
   expect(rendered.split("\n")).toContain("Questions suppressed: 2")
+})
+
+// --- In-place limit editing -------------------------------------------------
+// These reproduce the reported failure verbatim: a goal capped at 36000s that
+// ran to 42478s elapsed with 98% of its token budget unspent, which before
+// update_goal_limits could only be recovered by clearGoal + createGoal.
+
+const DURATION_CAP = 36_000
+const ELAPSED = 42_478
+
+async function limitedByDuration(sessionID = "ses_1") {
+  const start = new Date("2026-08-30T00:00:00.000Z")
+  setSystemTime(start)
+  const created = await createGoal(sessionID, "run the long-haul pipeline to completion", {
+    tokenBudget: 300_000_000,
+    maxDurationSeconds: DURATION_CAP,
+  })
+  await recordAssistantProgress(sessionID, { messageID: "m1", text: "first pass done", outputTokens: 900 })
+  await accountUsage(sessionID, 6_786_208)
+  setSystemTime(new Date(start.getTime() + ELAPSED * 1000))
+  const limited = await reserveContinuation(sessionID, 100, 0)
+  setSystemTime()
+  return { created, limited }
+}
+
+test("a duration-capped goal reports which limit stopped it and how much it overran", async () => {
+  const { limited } = await limitedByDuration()
+
+  expect(limited?.status).toBe("usageLimited")
+  const goal = await getGoal("ses_1")
+  expect(goal?.status).toBe("usageLimited")
+  expect(goal?.timeUsedSeconds).toBe(ELAPSED)
+  expect(goal?.limitKind).toBe("duration")
+  expect(goal?.exhaustedLimits).toEqual([{ kind: "duration", used: ELAPSED, cap: DURATION_CAP }])
+  // The stop reason carries both numbers, not just the cap.
+  expect(goal?.stopReason).toContain(`elapsed ${ELAPSED}s >= duration cap ${DURATION_CAP}s`)
+  // The token budget is untouched, which is what makes the goal worth saving.
+  expect(goal?.remainingTokens).toBe(300_000_000 - 6_786_208)
+  expect(goal?.remainingSeconds).toBe(0)
+})
+
+test("resuming a goal whose duration is already exhausted is refused, not silently re-limited", async () => {
+  await limitedByDuration()
+
+  const resumed = await setGoalStatus("ses_1", "active")
+
+  // The old behavior flipped to active for one instant and re-limited on the
+  // next continuation. It must never report a resume that did not happen.
+  expect(resumed.status).toBe("usageLimited")
+  expect(resumed.stopReason).toContain(`elapsed ${ELAPSED}s >= duration cap ${DURATION_CAP}s`)
+  expect(resumed.lastStatus).toContain("Resume refused")
+  expect(resumed.lastStatus).toContain("additional_seconds")
+  expect((await getGoal("ses_1"))?.status).toBe("usageLimited")
+})
+
+test("raising the duration cap in place preserves history, checkpoints, and elapsed accounting", async () => {
+  const { created } = await limitedByDuration()
+  const before = await getGoal("ses_1")
+  expect(before!.history.length).toBeGreaterThan(0)
+  expect(before!.checkpoints.length).toBeGreaterThan(0)
+
+  const raised = await updateGoalLimits("ses_1", { maxDurationSeconds: 72_000 })
+
+  expect(raised.maxDurationSeconds).toBe(72_000)
+  expect(raised.exhaustedLimits).toEqual([])
+  expect(raised.limitKind).toBeNull()
+  // The four things clearGoal + createGoal would have destroyed.
+  expect(raised.objective).toBe(before!.objective)
+  expect(raised.createdAt).toBe(created.createdAt)
+  expect(raised.timeUsedSeconds).toBe(ELAPSED)
+  expect(raised.tokensUsed).toBe(before!.tokensUsed)
+  expect(raised.checkpoints).toEqual(before!.checkpoints)
+  expect(raised.history.slice(0, before!.history.length)).toEqual(before!.history)
+  expect(raised.history.at(-1)?.detail).toContain("maxDurationSeconds 36000 -> 72000")
+
+  // Status is deliberately unchanged; the resume is a separate explicit step.
+  expect(raised.status).toBe("usageLimited")
+  const resumed = await setGoalStatus("ses_1", "active")
+  expect(resumed.status).toBe("active")
+  expect(resumed.stopReason).toBeNull()
+})
+
+test("an increment anchors on elapsed time, not on an already-overrun cap", async () => {
+  await limitedByDuration()
+
+  // 36000 + 3600 = 39600 would still be below the 42478 already elapsed, so the
+  // goal would re-limit instantly. The increment must buy real runway.
+  const raised = await updateGoalLimits("ses_1", { additionalSeconds: 3_600 })
+
+  expect(raised.maxDurationSeconds).toBe(ELAPSED + 3_600)
+  expect(raised.exhaustedLimits).toEqual([])
+  expect((await setGoalStatus("ses_1", "active")).status).toBe("active")
+})
+
+test("resuming with additional_seconds buys runway and resumes in one call", async () => {
+  await limitedByDuration()
+
+  const resumed = await setGoalStatus("ses_1", "active", null, { additionalSeconds: 7_200 })
+
+  expect(resumed.status).toBe("active")
+  expect(resumed.stopReason).toBeNull()
+  expect(resumed.maxDurationSeconds).toBe(ELAPSED + 7_200)
+  expect(resumed.remainingSeconds).toBe(7_200)
+  expect(resumed.history.some((entry) => entry.detail.includes("maxDurationSeconds"))).toBe(true)
+})
+
+test("resuming with an increment that is still not enough stays refused", async () => {
+  const start = new Date("2026-08-30T00:00:00.000Z")
+  setSystemTime(start)
+  await createGoal("ses_1", "long haul", { tokenBudget: 100, maxDurationSeconds: 60 })
+  await accountUsage("ses_1", 100)
+  setSystemTime(new Date(start.getTime() + 600 * 1000))
+  await reserveContinuation("ses_1", 100, 0)
+  setSystemTime()
+
+  // Duration is raised, but the token budget is still exhausted.
+  const resumed = await setGoalStatus("ses_1", "active", null, { additionalSeconds: 3_600 })
+
+  expect(resumed.status).toBe("budgetLimited")
+  expect(resumed.limitKind).toBe("tokens")
+  expect(resumed.lastStatus).toContain("additional_tokens")
+})
+
+test("update_goal_limits accepts absolute values, clears caps with null, and rejects mixed intent", async () => {
+  await createGoal("ses_1", "scoped work", { tokenBudget: 100, maxAutoTurns: 5, maxDurationSeconds: 60 })
+
+  const cleared = await updateGoalLimits("ses_1", { maxDurationSeconds: null, tokenBudget: 500 })
+  expect(cleared.maxDurationSeconds).toBeNull()
+  expect(cleared.remainingSeconds).toBeNull()
+  expect(cleared.tokenBudget).toBe(500)
+  expect(cleared.maxAutoTurns).toBe(5)
+
+  // An increment must never impose a cap on an already-unlimited dimension.
+  const unchanged = await updateGoalLimits("ses_1", { additionalSeconds: 900 })
+  expect(unchanged.maxDurationSeconds).toBeNull()
+
+  await expect(updateGoalLimits("ses_1", { tokenBudget: 900, additionalTokens: 10 })).rejects.toThrow(
+    "cannot set and increment tokenBudget",
+  )
+  await expect(updateGoalLimits("ses_1", { additionalTokens: -5 })).rejects.toThrow("must be a positive integer")
+})
+
+test("update_goal_limits refuses a closed goal", async () => {
+  await createGoal("ses_1", "finish", { maxDurationSeconds: 60 })
+  await completeGoal("ses_1", "verified locally")
+
+  await expect(updateGoalLimits("ses_1", { additionalSeconds: 60 })).rejects.toThrow("cannot update limits on a complete goal")
+})
+
+test("reset_elapsed zeroes the clock and is opt-in", async () => {
+  await limitedByDuration()
+  expect((await getGoal("ses_1"))?.timeUsedSeconds).toBe(ELAPSED)
+
+  const reset = await updateGoalLimits("ses_1", { resetElapsed: true })
+
+  expect(reset.timeUsedSeconds).toBe(0)
+  expect(reset.maxDurationSeconds).toBe(DURATION_CAP)
+  expect(reset.exhaustedLimits).toEqual([])
+  expect(reset.history.at(-1)?.detail).toContain(`elapsed ${ELAPSED}s -> 0s`)
+  expect((await setGoalStatus("ses_1", "active")).status).toBe("active")
+})
+
+test("an exhausted auto-continue cap is reported as autoTurns, not as a duration overrun", async () => {
+  await createGoal("ses_1", "bounded turns", { maxAutoTurns: 1 })
+  await reserveContinuation("ses_1", 100, 0)
+  const limited = await reserveContinuation("ses_1", 100, 0)
+
+  expect(limited?.status).toBe("usageLimited")
+  const goal = await getGoal("ses_1")
+  expect(goal?.limitKind).toBe("autoTurns")
+  expect(goal?.exhaustedLimits).toEqual([{ kind: "autoTurns", used: 1, cap: 1 }])
+
+  const raised = await updateGoalLimits("ses_1", { additionalAutoTurns: 4 })
+  expect(raised.maxAutoTurns).toBe(5)
+  expect((await setGoalStatus("ses_1", "active")).status).toBe("active")
+})
+
+test("snapshot markdown carries the verbatim objective, limits, and full history", async () => {
+  const objective = "Ship the long-haul pipeline: line one\nline two with <angle> brackets"
+  await createGoal("ses_1", objective, { tokenBudget: 100, maxDurationSeconds: 60 })
+  await recordAssistantProgress("ses_1", { messageID: "m1", text: "made progress on stage one", outputTokens: 900 })
+
+  const markdown = formatGoalSnapshotMarkdown(await getGoal("ses_1"))
+
+  // Verbatim, not summarized: re-passing the objective is exactly what makes
+  // clear + create expensive, so the export has to be sufficient on its own.
+  expect(markdown).toContain(objective)
+  expect(markdown).toContain("# Goal snapshot")
+  expect(markdown).toContain("| Token budget | 100 |")
+  expect(markdown).toContain("| Duration cap | 60s |")
+  expect(markdown).toContain("**created**")
+  expect(markdown).toContain("made progress on stage one")
+  expect(formatGoalSnapshotMarkdown(null)).toContain("No goal is set")
+})
+
+test("snapshot markdown spells out the remediation for an exhausted goal", async () => {
+  await limitedByDuration()
+
+  const markdown = formatGoalSnapshotMarkdown(await getGoal("ses_1"))
+
+  expect(markdown).toContain("## Exhausted limits")
+  expect(markdown).toContain(`elapsed ${ELAPSED}s >= duration cap ${DURATION_CAP}s`)
+  expect(markdown).toContain("additional_seconds")
+  expect(markdown).toContain("discards them")
 })

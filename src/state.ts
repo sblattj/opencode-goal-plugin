@@ -41,6 +41,44 @@ export type CreateGoalOptions = {
   initialStatus?: MutableGoalStatus
 }
 
+/**
+ * Which cap stopped a goal. Deliberately NOT folded into GoalStatus: that union
+ * is a persisted Schema.Literal, so a new status value would make a newer state
+ * file undecodable by an older plugin (readStateEffect re-raises StateDecodeError
+ * on anything but ENOENT, which hides every goal in the file, not just the new
+ * one). This rides along on the snapshot instead, derived on read and never
+ * written, so it costs nothing in compatibility.
+ */
+export type GoalLimitKind = "duration" | "tokens" | "autoTurns"
+
+export type ExhaustedLimit = {
+  kind: GoalLimitKind
+  used: number
+  cap: number
+}
+
+/**
+ * An in-place edit of a goal's limits. Each dimension accepts EITHER an absolute
+ * value (key present, null clears the cap) OR an increment; passing both for one
+ * dimension is rejected rather than silently resolved, because the two express
+ * opposite intents and guessing wrong is unrecoverable from the caller's side.
+ */
+export type GoalLimitInput = {
+  tokenBudget?: number | null
+  maxAutoTurns?: number | null
+  maxDurationSeconds?: number | null
+  additionalTokens?: number | null
+  additionalSeconds?: number | null
+  additionalAutoTurns?: number | null
+  resetElapsed?: boolean
+}
+
+/** The increment-only subset accepted when resuming a limited goal. */
+export type ResumeOptions = Pick<
+  GoalLimitInput,
+  "additionalTokens" | "additionalSeconds" | "additionalAutoTurns" | "resetElapsed"
+>
+
 export type AssistantProgressInput = {
   messageID?: string
   text?: string
@@ -237,9 +275,14 @@ export type GoalSnapshot = Omit<
   "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "pendingAttempt" | "usageTrackers"
 > & {
   remainingTokens: number | null
+  remainingSeconds: number | null
   sampledAt: number
   autoTurns: number
   lastContinuationAt: number | null
+  /** Every cap already at or past its limit, derived on read. Empty when the goal has runway. */
+  exhaustedLimits: ExhaustedLimit[]
+  /** The first exhausted cap, or null. Lets a caller pick a remediation without parsing stopReason. */
+  limitKind: GoalLimitKind | null
 }
 
 /** Internal view of a goal with the pending-attempt lifecycle exposed. */
@@ -540,12 +583,62 @@ function remainingTokens(goal: Goal) {
   return goal.tokenBudget == null ? null : Math.max(0, goal.tokenBudget - goal.tokensUsed)
 }
 
+function remainingSeconds(goal: Goal, timeUsedSeconds: number) {
+  return goal.maxDurationSeconds == null ? null : Math.max(0, goal.maxDurationSeconds - timeUsedSeconds)
+}
+
+/**
+ * Every per-goal cap already met or exceeded, using the live elapsed value so a
+ * running goal is judged on the same number maybeStopForUsageLimit will see.
+ * maxAutoTurns is only reported when the goal carries its own cap: the server's
+ * fallback default is not a property of the goal and must not be invented here.
+ */
+function exhaustedLimitsFor(goal: Goal, timeUsedSeconds: number): ExhaustedLimit[] {
+  const exhausted: ExhaustedLimit[] = []
+  if (goal.maxDurationSeconds != null && timeUsedSeconds >= goal.maxDurationSeconds) {
+    exhausted.push({ kind: "duration", used: timeUsedSeconds, cap: goal.maxDurationSeconds })
+  }
+  if (goal.tokenBudget != null && goal.tokensUsed >= goal.tokenBudget) {
+    exhausted.push({ kind: "tokens", used: goal.tokensUsed, cap: goal.tokenBudget })
+  }
+  if (goal.maxAutoTurns != null && goal.autoTurns >= goal.maxAutoTurns) {
+    exhausted.push({ kind: "autoTurns", used: goal.autoTurns, cap: goal.maxAutoTurns })
+  }
+  return exhausted
+}
+
+function liveTimeUsedSeconds(goal: Goal, now = nowSeconds()) {
+  const activeSeconds = goal.status === "active" && goal.lastAccountedAt != null ? Math.max(0, now - goal.lastAccountedAt) : 0
+  return goal.timeUsedSeconds + activeSeconds
+}
+
+function describeExhausted(limit: ExhaustedLimit) {
+  if (limit.kind === "duration") return `elapsed ${limit.used}s >= duration cap ${limit.cap}s`
+  if (limit.kind === "tokens") return `tokens used ${limit.used} >= token budget ${limit.cap}`
+  return `auto-continues ${limit.used} >= auto-continue cap ${limit.cap}`
+}
+
+function remediationFor(limits: ExhaustedLimit[]) {
+  const increments = limits.map((limit) =>
+    limit.kind === "duration"
+      ? `additional_seconds (elapsed ${limit.used}s already exceeds the ${limit.cap}s cap)`
+      : limit.kind === "tokens"
+        ? `additional_tokens (${limit.used} used against a ${limit.cap} budget)`
+        : `additional_auto_turns (${limit.used} used against a ${limit.cap} cap)`,
+  )
+  return `Resuming will re-limit immediately until the exhausted cap is raised. Call update_goal_limits, or resume with ${increments.join(" and ")}. Raising a cap preserves history, checkpoints and elapsed accounting; clear_goal + create_goal discards them.`
+}
+
+/** The status a goal with these exhausted caps belongs in. */
+function limitedStatusFor(limits: ExhaustedLimit[]): GoalStatus {
+  return limits.every((limit) => limit.kind === "tokens") ? "budgetLimited" : "usageLimited"
+}
+
 export function snapshot(goal: Goal): GoalSnapshot {
   normalizeGoal(goal)
   const sampledAt = nowSeconds()
-  const activeSeconds =
-    goal.status === "active" && goal.lastAccountedAt != null ? Math.max(0, sampledAt - goal.lastAccountedAt) : 0
-  const timeUsedSeconds = goal.timeUsedSeconds + activeSeconds
+  const timeUsedSeconds = liveTimeUsedSeconds(goal, sampledAt)
+  const exhausted = exhaustedLimitsFor(goal, timeUsedSeconds)
   return {
     sessionID: goal.sessionID,
     objective: goal.objective,
@@ -580,6 +673,9 @@ export function snapshot(goal: Goal): GoalSnapshot {
     autoTurns: goal.autoTurns,
     lastContinuationAt: goal.lastContinuationAt,
     remainingTokens: remainingTokens(goal),
+    remainingSeconds: remainingSeconds(goal, timeUsedSeconds),
+    exhaustedLimits: exhausted,
+    limitKind: exhausted[0]?.kind ?? null,
     sampledAt,
   }
 }
@@ -779,12 +875,158 @@ export async function pauseGoalForPlanMode(sessionID: string) {
   })
 }
 
-export async function setGoalStatus(sessionID: string, status: MutableGoalStatus, agent?: string | null) {
+/**
+ * Resolve one cap from either an absolute value or an increment.
+ *
+ * The increment anchors on `max(current, used)` rather than on `current`. That
+ * is the whole point of the increment path: a goal stopped at 42478s elapsed
+ * against a 36000s cap gains nothing from 36000 + 3600, because the result is
+ * still below the elapsed value and the goal re-limits on the next continuation.
+ * Anchoring on the larger of the two always buys the full requested runway.
+ */
+function resolveCap(
+  label: string,
+  current: number | null,
+  used: number,
+  hasAbsolute: boolean,
+  absolute: number | null,
+  increment: number | null,
+  changes: string[],
+): number | null {
+  if (hasAbsolute && increment != null) {
+    throw new Error(`cannot set and increment ${label} in the same call; pass one or the other`)
+  }
+  if (hasAbsolute) {
+    if (absolute == null) {
+      if (current != null) changes.push(`${label} ${current} -> unlimited`)
+      return null
+    }
+    const next = positiveIntegerOrNull(absolute)
+    if (next == null) throw new Error(`${label} must be a positive integer or null`)
+    if (next !== current) changes.push(`${label} ${current ?? "unlimited"} -> ${next}`)
+    return next
+  }
+  if (increment == null) return current
+  const step = positiveIntegerOrNull(increment)
+  if (step == null) throw new Error(`the ${label} increment must be a positive integer`)
+  // An absent cap already means unlimited. An increment must never impose one.
+  if (current == null) return null
+  const anchor = Math.max(current, used)
+  const next = anchor + step
+  changes.push(`${label} ${current} -> ${next} (+${step} from ${anchor})`)
+  return next
+}
+
+/**
+ * Apply a limit edit in place. `allowAbsolute` is false on the resume path, where
+ * only increments are offered, so a resume can never silently shrink a cap.
+ */
+function applyLimitInput(goal: Goal, input: GoalLimitInput, allowAbsolute: boolean) {
+  const changes: string[] = []
+  const provided = (key: keyof GoalLimitInput) =>
+    allowAbsolute && Object.prototype.hasOwnProperty.call(input, key) && input[key] !== undefined
+
+  // Runs before the duration resolve so an increment anchors on the reset value.
+  if (input.resetElapsed === true && goal.timeUsedSeconds !== 0) {
+    changes.push(`elapsed ${goal.timeUsedSeconds}s -> 0s`)
+    goal.timeUsedSeconds = 0
+    if (goal.lastAccountedAt != null) goal.lastAccountedAt = nowSeconds()
+  }
+
+  goal.maxDurationSeconds = resolveCap(
+    "maxDurationSeconds",
+    goal.maxDurationSeconds,
+    goal.timeUsedSeconds,
+    provided("maxDurationSeconds"),
+    input.maxDurationSeconds ?? null,
+    input.additionalSeconds ?? null,
+    changes,
+  )
+  goal.tokenBudget = resolveCap(
+    "tokenBudget",
+    goal.tokenBudget,
+    goal.tokensUsed,
+    provided("tokenBudget"),
+    input.tokenBudget ?? null,
+    input.additionalTokens ?? null,
+    changes,
+  )
+  goal.maxAutoTurns = resolveCap(
+    "maxAutoTurns",
+    goal.maxAutoTurns,
+    goal.autoTurns,
+    provided("maxAutoTurns"),
+    input.maxAutoTurns ?? null,
+    input.additionalAutoTurns ?? null,
+    changes,
+  )
+  return changes
+}
+
+/**
+ * Raise, lower, or clear a goal's limits without recreating it. Preserves
+ * history, checkpoints, createdAt, and elapsed accounting, which is the entire
+ * reason this exists: before it, the only way to give a duration-capped goal
+ * more runway was clearGoal + createGoal, which discards all four.
+ *
+ * Status is deliberately untouched. A limited goal stays limited until the
+ * caller resumes it explicitly; this call only makes that resume able to succeed.
+ */
+export async function updateGoalLimits(sessionID: string, input: GoalLimitInput) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal) throw new Error("cannot update goal limits because this session has no goal")
+    if (isClosed(goal.status)) {
+      throw new Error(`cannot update limits on a ${goal.status} goal; only a non-closed goal can be re-scoped`)
+    }
+    accountWallClock(goal)
+    const changes = applyLimitInput(goal, input, true)
+    goal.updatedAt = nowSeconds()
+    if (changes.length === 0) {
+      goal.lastStatus = "Goal limits unchanged."
+      return snapshot(goal)
+    }
+    // Re-arm the wrap-up prompt: budgetWrapupSent was set against the old cap,
+    // and leaving it true would make a later re-limit skip the final handoff.
+    goal.budgetWrapupSent = false
+    goal.lastStatus = `Goal limits updated: ${changes.join("; ")}.`
+    pushHistory(goal, "updated", goal.lastStatus)
+    return snapshot(goal)
+  })
+}
+
+export async function setGoalStatus(
+  sessionID: string,
+  status: MutableGoalStatus,
+  agent?: string | null,
+  options?: ResumeOptions,
+) {
   const agentValue = typeof agent === "string" && agent.trim() ? agent.trim() : null
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
     accountWallClock(goal)
+    if (agentValue) goal.lastPromptAgent = agentValue
+    if (status === "active") {
+      // Increments land before the runway check so "resume with more budget" is
+      // one atomic step rather than a resume that re-limits on the way in.
+      const changes = options ? applyLimitInput(goal, options, false) : []
+      if (changes.length > 0) pushHistory(goal, "updated", `Goal limits updated: ${changes.join("; ")}.`)
+      const exhausted = exhaustedLimitsFor(goal, goal.timeUsedSeconds)
+      if (exhausted.length > 0) {
+        // Refuse the resume rather than flipping to active for one instant and
+        // re-limiting on the next continuation. The old behavior reported a
+        // successful resume and then silently reverted, which read as the goal
+        // being unrecoverable instead of as a cap that needed raising.
+        goal.status = limitedStatusFor(exhausted)
+        goal.lastAccountedAt = null
+        goal.stopReason = exhausted.map(describeExhausted).join("; ")
+        goal.lastStatus = `Resume refused: ${goal.stopReason}. ${remediationFor(exhausted)}`
+        goal.updatedAt = nowSeconds()
+        pushHistory(goal, "limited", goal.lastStatus)
+        return snapshot(goal)
+      }
+    }
     goal.status = status
     goal.updatedAt = nowSeconds()
     goal.lastAccountedAt = status === "active" ? goal.updatedAt : null
@@ -794,7 +1036,6 @@ export async function setGoalStatus(sessionID: string, status: MutableGoalStatus
     goal.stopReason = status === "active" ? null : "paused"
     goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent
     goal.blocker = status === "active" ? null : goal.blocker
-    if (agentValue) goal.lastPromptAgent = agentValue
     goal.lastStatus = status === "active" ? "Goal resumed." : "Goal paused."
     pushHistory(goal, status === "active" ? "resumed" : "paused", goal.lastStatus)
     return snapshot(goal)
@@ -1206,10 +1447,11 @@ function maybeStopForBudget(goal: Goal) {
   if (goal.status !== "active") return
   if (goal.tokenBudget == null || goal.tokensUsed < goal.tokenBudget) return
   accountWallClock(goal)
+  const limit: ExhaustedLimit = { kind: "tokens", used: goal.tokensUsed, cap: goal.tokenBudget }
   goal.status = "budgetLimited"
   goal.lastAccountedAt = null
-  goal.stopReason = `token budget reached (${goal.tokensUsed}/${goal.tokenBudget})`
-  goal.lastStatus = `${goal.stopReason}; wrap-up required.`
+  goal.stopReason = `token budget reached (${describeExhausted(limit)})`
+  goal.lastStatus = `${goal.stopReason}; wrap-up required. ${remediationFor([limit])}`
   pushHistory(goal, "limited", goal.lastStatus)
 }
 
@@ -1217,18 +1459,20 @@ function maybeStopForUsageLimit(goal: Goal, defaultMaxAutoTurns: number, now = n
   if (goal.status !== "active") return false
   const effectiveMaxAutoTurns = goal.maxAutoTurns ?? defaultMaxAutoTurns
   if (effectiveMaxAutoTurns > 0 && goal.autoTurns >= effectiveMaxAutoTurns) {
+    const limit: ExhaustedLimit = { kind: "autoTurns", used: goal.autoTurns, cap: effectiveMaxAutoTurns }
     goal.status = "usageLimited"
     goal.lastAccountedAt = null
-    goal.stopReason = `max auto-continues reached (${effectiveMaxAutoTurns})`
-    goal.lastStatus = `${goal.stopReason}; wrap-up required.`
+    goal.stopReason = `max auto-continues reached (${describeExhausted(limit)})`
+    goal.lastStatus = `${goal.stopReason}; wrap-up required. ${remediationFor([limit])}`
     pushHistory(goal, "limited", goal.lastStatus)
     return true
   }
   if (goal.maxDurationSeconds != null && goal.timeUsedSeconds >= goal.maxDurationSeconds) {
+    const limit: ExhaustedLimit = { kind: "duration", used: goal.timeUsedSeconds, cap: goal.maxDurationSeconds }
     goal.status = "usageLimited"
     goal.lastAccountedAt = null
-    goal.stopReason = `max duration reached (${goal.maxDurationSeconds}s)`
-    goal.lastStatus = `${goal.stopReason}; wrap-up required.`
+    goal.stopReason = `max duration reached (${describeExhausted(limit)})`
+    goal.lastStatus = `${goal.stopReason}; wrap-up required. ${remediationFor([limit])}`
     pushHistory(goal, "limited", goal.lastStatus)
     goal.updatedAt = now
     return true
@@ -1290,6 +1534,8 @@ export function formatGoal(goal: GoalSnapshot | null) {
   ]
   if (goal.remainingTokens != null) lines.push(`Tokens remaining: ${goal.remainingTokens}`)
   if (goal.maxDurationSeconds != null) lines.push(`Duration limit: ${goal.maxDurationSeconds}s`)
+  if (goal.remainingSeconds != null) lines.push(`Time remaining: ${goal.remainingSeconds}s`)
+  if (goal.limitKind) lines.push(`Limited by: ${goal.exhaustedLimits.map(describeExhausted).join("; ")}`)
   if (goal.noProgressTurns > 0) lines.push(`No-progress turns: ${goal.noProgressTurns}`)
   if (goal.questionsSuppressed > 0) lines.push(`Questions suppressed: ${goal.questionsSuppressed}`)
   if (goal.lastCheckpoint) lines.push(`Latest checkpoint: ${goal.lastCheckpoint.summary}`)
@@ -1298,6 +1544,81 @@ export function formatGoal(goal: GoalSnapshot | null) {
   if (goal.completionEvidence) lines.push(`Completion evidence: ${goal.completionEvidence}`)
   if (goal.blocker) lines.push(`Blocker: ${goal.blocker}`)
   return lines.join("\n")
+}
+
+function isoOrDash(seconds: number | null | undefined) {
+  return seconds == null ? "-" : new Date(seconds * 1000).toISOString()
+}
+
+/**
+ * A complete, self-contained markdown export of a goal. Exists so the full
+ * objective and accounting can be preserved before a destructive clear without
+ * the caller hand-rolling a file: the objective is emitted verbatim (never
+ * summarized) because re-passing it is exactly what makes clear + create
+ * expensive.
+ */
+export function formatGoalSnapshotMarkdown(goal: GoalSnapshot | null) {
+  if (!goal) return "# Goal snapshot\n\nNo goal is set for this session."
+  const limits = [
+    `| Token budget | ${goal.tokenBudget ?? "unlimited"} |`,
+    `| Tokens used | ${goal.tokensUsed} |`,
+    `| Tokens remaining | ${goal.remainingTokens ?? "unlimited"} |`,
+    `| Duration cap | ${goal.maxDurationSeconds == null ? "unlimited" : `${goal.maxDurationSeconds}s`} |`,
+    `| Time used | ${goal.timeUsedSeconds}s |`,
+    `| Time remaining | ${goal.remainingSeconds == null ? "unlimited" : `${goal.remainingSeconds}s`} |`,
+    `| Auto-continue cap | ${goal.maxAutoTurns ?? "server default"} |`,
+    `| Auto-continues used | ${goal.autoTurns} |`,
+  ]
+  const lines = [
+    "# Goal snapshot",
+    "",
+    `- Session: \`${goal.sessionID}\``,
+    `- Status: \`${goal.status}\`${goal.limitKind ? ` (limited by ${goal.limitKind})` : ""}`,
+    `- Created: ${isoOrDash(goal.createdAt)}`,
+    `- Updated: ${isoOrDash(goal.updatedAt)}`,
+    `- Exported: ${isoOrDash(goal.sampledAt)}`,
+    ...(goal.closedAt ? [`- Closed: ${isoOrDash(goal.closedAt)}`] : []),
+    "",
+    "## Objective",
+    "",
+    goal.objective,
+    "",
+    "## Limits and usage",
+    "",
+    "| Limit | Value |",
+    "| --- | --- |",
+    ...limits,
+    "",
+  ]
+  if (goal.exhaustedLimits.length > 0) {
+    lines.push(
+      "## Exhausted limits",
+      "",
+      ...goal.exhaustedLimits.map((limit) => `- ${describeExhausted(limit)}`),
+      "",
+      remediationFor(goal.exhaustedLimits),
+      "",
+    )
+  }
+  if (goal.stopReason) lines.push("## Stop reason", "", goal.stopReason, "")
+  if (goal.lastStatus) lines.push("## Last status", "", goal.lastStatus, "")
+  if (goal.completionEvidence) lines.push("## Completion evidence", "", goal.completionEvidence, "")
+  if (goal.blocker) lines.push("## Blocker", "", goal.blocker, "")
+  lines.push(
+    "## Checkpoints",
+    "",
+    ...(goal.checkpoints.length === 0
+      ? ["_No checkpoints recorded._"]
+      : goal.checkpoints.map((checkpoint) => `- [${isoOrDash(checkpoint.timestamp)}] ${checkpoint.summary}`)),
+    "",
+    "## History",
+    "",
+    ...(goal.history.length === 0
+      ? ["_No history recorded._"]
+      : goal.history.map((entry) => `- [${isoOrDash(entry.timestamp)}] **${entry.type}**: ${entry.detail}`)),
+    "",
+  )
+  return lines.join("\n").trimEnd()
 }
 
 export function formatGoalHistory(goal: GoalSnapshot | null) {

@@ -49,6 +49,7 @@ function budgetLines(goal: GoalSnapshot) {
     `- Tokens remaining: ${goal.remainingTokens ?? "unbounded"}`,
     `- Auto-continues used: ${goal.autoTurns}${goal.maxAutoTurns == null ? "" : `/${goal.maxAutoTurns}`}`,
     `- Duration limit: ${goal.maxDurationSeconds == null ? "none" : `${goal.maxDurationSeconds} seconds`}`,
+    `- Time remaining: ${goal.remainingSeconds == null ? "unbounded" : `${goal.remainingSeconds} seconds`}`,
   ].join("\n")
 }
 
@@ -79,8 +80,10 @@ ${budgetLines(goal)}
 
 Status: ${goal.status}
 Stop reason: ${goal.stopReason ?? "goal limit reached"}
+${goal.limitKind == null ? "" : `Limited by: ${goal.limitKind}\n`}
+Do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step. Do not call update_goal unless the goal is actually complete.
 
-Do not start new substantive work for this goal. Wrap up this turn soon: summarize useful progress, identify remaining work or blockers, and leave the user with a clear next step. Do not call update_goal unless the goal is actually complete.`
+This limit is adjustable, not terminal. Tell the user the goal can continue if they raise the exhausted limit, and that doing so keeps its history and checkpoints. If they ask to continue, call update_goal_limits (or update_goal_status with the matching additional_seconds, additional_tokens, or additional_auto_turns). Never clear and recreate the goal to get around a limit.`
 }
 
 export function systemReminder() {

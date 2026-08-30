@@ -94,6 +94,8 @@ const GOAL_TOOL_NAMES: readonly string[] = [
   "update_goal",
   "update_goal_objective",
   "update_goal_status",
+  "update_goal_limits",
+  "snapshot_goal",
   "clear_goal",
 ]
 
