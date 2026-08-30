@@ -76,7 +76,7 @@ by scheduling a continuation straight from the compaction hook, under a purpose 
 +          scheduleSettledContinuation(
 +            input.sessionID,
 +            continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
-+            false,
++            true,
 +            "compaction",
 +          )
 +      }
@@ -84,9 +84,15 @@ by scheduling a continuation straight from the compaction hook, under a purpose 
 ```
 
 The scheduled timer fires `runAutoContinue()` once the turn settles, which clears the stranded
-`awaiting` flag and reserves a fresh continuation. `scheduleSettledContinuation(…, false, …)` will not
-stack on an existing scheduled continuation, and `reserveContinuation`'s `min_continue_interval` guard
+`awaiting` flag and reserves a fresh continuation. `reserveContinuation`'s `min_continue_interval` guard
 prevents a double-continue.
+
+The re-arm passes `replace = true`, and that argument is load-bearing rather than incidental.
+`scheduleSettledContinuation` returns early when an entry already exists for the session, so with
+`replace = false` this call is a **silent no-op** whenever a continuation is already scheduled — the
+existing entry survives with whatever purpose it already had, and the `"compaction"` purpose below is
+never applied. Replacing cannot push the deadline out, because `continuationDelayFromSnapshot` computes
+an absolute wake time from `lastContinuationAt` rather than a fresh interval from now.
 
 **The purpose matters, and `0.2.0` through `0.3.0` got it wrong.** Those versions scheduled this re-arm
 as `"recovery"`. A `"recovery"` timer is a *transport-dead* timer: model output proves the transport came
@@ -97,15 +103,23 @@ remaining. `0.3.1` gives the re-arm its own `"compaction"` purpose, which the fo
 paths spare (`PROGRESS_SAFE_PURPOSES` in `src/server.ts`). The transport-dead timer is unchanged and
 still cancels on output.
 
+**`0.3.1` was necessary but not sufficient, and `0.3.2` finishes it.** `0.3.1` kept scheduling the
+re-arm with `replace = false`, so the whole fix was dropped whenever a continuation was already
+scheduled and the `"compaction"` purpose never reached the map. That is why the failure read as
+intermittent: the first compaction of a session lands on an empty schedule map and works, while a later
+one usually does not, so a session would survive one compaction and strand on the next.
+
 **Scope.** `src/server.ts` exports two implementations. `"experimental.compaction.autocontinue"` is
 registered only in the **v1** `server` export; `setupV2` never registers a compaction hook, so there is
 no equivalent bug on the OpenCode 2 path. The v1 path is the one that runs against OpenCode 1.x.
 
 **How far this is verified.** Unit tests, typecheck, lint and the build all pass, and a regression test
 drives the compaction hook followed by immediate tool and assistant output, asserting the continuation is
-still reserved; that test fails against the pre-`0.3.1` tree. The shipped `dist/server.js` was driven
-through the same scenario directly and compared against the shipped `0.3.0` bundle as a control: `0.3.0`
-emits zero continuations and leaves `autoTurns` at 0, `0.3.1` emits the continuation and advances it. A
+still reserved; that test fails against the pre-`0.3.1` tree. A second regression test arms a
+non-progress-safe timer first and then compacts, reproducing the dropped re-arm; it fails against the
+pre-`0.3.2` tree. Both shipped bundles were driven through their scenario directly against a control:
+`0.3.0` emits zero continuations where `0.3.1` emits one, and `0.3.1` emits zero where `0.3.2` emits one
+once a timer is already pending. A
 live goal surviving a real compaction inside a running OpenCode session over many hours has still **not**
 been observed end to end — that gap is what let the `"recovery"` purpose ship in `0.2.0`. The change has
 not been submitted upstream, so upstream carries neither the fix nor any statement about this behaviour.

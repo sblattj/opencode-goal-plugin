@@ -1707,11 +1707,22 @@ const server: Plugin = async ({ client }, options?: Options) => {
         // the model produces output almost immediately, so scheduling this as
         // "recovery" cancelled it before it could ever fire. See
         // PROGRESS_SAFE_PURPOSES.
+        //
+        // It must also REPLACE, because a continuation is often already
+        // scheduled when compaction fires -- routinely so on a second
+        // compaction, which is why a session survives the first and strands on
+        // a later one. Without replace this call is a silent no-op: the
+        // existing entry stays, keeping whatever purpose it had, so the
+        // "compaction" purpose above is never applied and the first
+        // post-compaction output cancels the timer anyway. Replacing cannot
+        // push the deadline out, because continuationDelayFromSnapshot
+        // computes an absolute wake time from lastContinuationAt rather than a
+        // fresh interval from now.
         if (autoContinue)
           scheduleSettledContinuation(
             input.sessionID,
             continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
-            false,
+            true,
             "compaction",
           )
       }

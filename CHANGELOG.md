@@ -14,6 +14,38 @@ The fork is consumed as a local file path and is **not published to npm**. There
 is no `@sblattj/opencode-goal-plugin` package; `dist/server.js` is committed and
 self-contained, and that file is the artifact.
 
+## [0.3.2] — 2026-08-30
+
+### Fixed
+
+- **The `0.3.1` compaction fix was itself dropped whenever a continuation was
+  already scheduled — so a session survived its first compaction and stranded on
+  a later one.** `0.3.1` gave the post-compaction re-arm its own `"compaction"`
+  purpose so that progress would stop cancelling it. It kept scheduling that
+  re-arm with `replace = false`, and `scheduleSettledContinuation` returns early
+  when an entry already exists for the session:
+
+  ```ts
+  if (!replace && scheduledContinuations.has(sessionID)) return
+  ```
+
+  So the call was a silent no-op in exactly the case that matters. The existing
+  entry stayed, keeping whatever purpose it already had, and the `"compaction"`
+  purpose was never applied. When that purpose was not progress-safe — a
+  `"recovery"` timer from a transport blip is the common one — the first
+  post-compaction output cancelled it, and with native autocontinue suppressed
+  there was no `session.idle` left to recover. Same stranded shape as before:
+  `active`, `stopReason: null`, `autoTurns` frozen, budget and time remaining.
+
+  This is why the failure looked intermittent and why upgrading appeared to help
+  for a while. The first compaction of a session lands on an empty schedule map
+  and works; a later one usually does not.
+
+  The re-arm now replaces. That cannot push the continuation's deadline out,
+  because `continuationDelayFromSnapshot` computes an absolute wake time from
+  `lastContinuationAt` rather than a fresh interval from now — so replacing
+  recomputes the same instant.
+
 ## [0.3.1] — 2026-08-30
 
 ### Fixed

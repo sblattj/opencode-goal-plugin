@@ -3572,3 +3572,67 @@ test("a compaction re-arm survives the model output that immediately follows it"
   expect(goal?.status).toBe("active")
   expect(goal?.autoTurns).toBe(1)
 })
+
+// The re-arm above only helps if it is actually installed. A continuation is
+// often already scheduled when compaction fires -- routinely so on a SECOND
+// compaction, which is why sessions survive the first and strand on a later
+// one. scheduleSettledContinuation leaves an existing entry alone by default,
+// so the re-arm was dropped and the entry kept its own non-progress-safe
+// purpose, which the next post-compaction output then cancelled.
+test("a compaction re-arm replaces a scheduled timer that would not survive progress", async () => {
+  const calls: unknown[] = []
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool!
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "survive a second compaction" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+
+  // A transport blip arms the recovery timer. This is the state a later
+  // compaction commonly arrives into, and a recovery timer dies on output.
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID: "ses_1", error: { message: "fetch failed" } },
+    } as never,
+  })
+
+  const output = { enabled: true }
+  await hooks["experimental.compaction.autocontinue"]!({ sessionID: "ses_1" } as never, output)
+  expect(output.enabled).toBe(false)
+
+  await hooks["tool.execute.after"]?.(
+    { tool: "read", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "read", output: "resumed work after the compaction", metadata: {} } as never,
+  )
+  await hooks.event!({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg_after_compaction",
+          role: "assistant",
+          sessionID: "ses_1",
+          time: { created: Date.now(), completed: Date.now() + 1 },
+        },
+      },
+    } as never,
+  })
+
+  await waitForContinuation(calls)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+  const goal = await getGoal("ses_1")
+  expect(goal?.status).toBe("active")
+  expect(goal?.autoTurns).toBe(1)
+})

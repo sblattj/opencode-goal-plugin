@@ -38516,7 +38516,7 @@ var server = async ({ client }, options) => {
       if (goal?.status === "active") {
         output.enabled = false;
         if (autoContinue)
-          scheduleSettledContinuation(input.sessionID, continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt), false, "compaction");
+          scheduleSettledContinuation(input.sessionID, continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt), true, "compaction");
       }
     },
     async event({ event }) {
