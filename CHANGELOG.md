@@ -14,6 +14,42 @@ The fork is consumed as a local file path and is **not published to npm**. There
 is no `@sblattj/opencode-goal-plugin` package; `dist/server.js` is committed and
 self-contained, and that file is the artifact.
 
+## [0.3.1] — 2026-08-30
+
+### Fixed
+
+- **A goal could still strand silently after a compaction — inside the very fix
+  this fork exists for.** `0.2.0` added a post-compaction re-arm, because
+  suppressing OpenCode's native autocontinue also suppresses the `session.idle`
+  that normally drives `runAutoContinue`. It scheduled that re-arm with the
+  `"recovery"` purpose. But `"recovery"` means *transport-dead timer*: model
+  output proves the transport came back, so every progress path cancels it on
+  sight. After a compaction the model resumes almost immediately — usually with a
+  tool call — so the re-arm was destroyed by the same in-window output it existed
+  to outlive. The goal was left `active`, with `stopReason: null`, `autoTurns`
+  frozen, budget and time remaining, and no further continuation ever emitted. It
+  reads as a hang, and only a user nudge recovers it.
+
+  The re-arm now has its own `"compaction"` purpose, spared by the four
+  progress-cancellation paths via `PROGRESS_SAFE_PURPOSES`. The transport-dead
+  `"recovery"` timer is unchanged and still cancels on output — the existing
+  tests covering that behaviour all still pass.
+
+  One of the four cancellation sites is a tool-output path whose guard
+  *specifically admitted* `"recovery"`, which made it the likeliest of the four to
+  reach the re-arm first, since a tool call is the usual first output after a
+  compaction. It is guarded too.
+
+  Verified with a control rather than by assertion: the shipped `0.3.0` bundle,
+  driven through a compaction followed by immediate tool and assistant output,
+  emits zero continuations and leaves `autoTurns` at 0; the `0.3.1` bundle emits
+  the continuation and advances it. The new regression test fails against the
+  pre-`0.3.1` tree.
+
+  Reported against the fork's `0.2.x` line. `0.3.0` did not fix it: the
+  compaction hook and the purpose union are byte-identical between `0.2.0` and
+  `0.3.0`, so upgrading to `0.3.0` for this bug would have changed nothing.
+
 ## [0.3.0] — 2026-08-30
 
 Hitting a wall-clock limit used to be functionally the same as losing the goal.
@@ -145,6 +181,7 @@ upstream `0aa2514`.
   npm, so a push-triggered run could only ever fail. Typecheck, lint and tests
   still run on every pull request via `ci.yml`.
 
+[0.3.1]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.1
 [0.3.0]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.0
 [0.2.1]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.2.1
 [0.2.0]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.2.0

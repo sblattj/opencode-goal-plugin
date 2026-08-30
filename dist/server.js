@@ -37240,6 +37240,10 @@ var DUPLICATE_GOAL_NOTICE = "This non-closed goal already exists. Do not call cr
 var CONFLICTING_GOAL_NOTICE = "A different non-closed goal already exists. Do not call create_goal or set_goal again. Report the conflict instead of replacing the goal; edit, clear, complete, or mark it unmet only when explicitly requested.";
 var RESTRICTED_GOAL_NOTICE = "Goal execution is not allowed from the current restricted agent or while the goal is paused for Plan mode. Switch to Build mode and resume the goal before doing substantive work.";
 var activeContinuations = new Set;
+var PROGRESS_SAFE_PURPOSES = new Set(["settle", "compaction"]);
+function survivesProgress(purpose) {
+  return purpose != null && PROGRESS_SAFE_PURPOSES.has(purpose);
+}
 function restrictedAgentSet(options) {
   if (options?.allow_goal_execution_from_plan === true)
     return new Set;
@@ -38209,7 +38213,7 @@ var server = async ({ client }, options) => {
       const observed = await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true);
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal);
       const queued = scheduledContinuations.get(sessionID);
-      if (observed.progressed && queued?.purpose !== "settle")
+      if (observed.progressed && !survivesProgress(queued?.purpose))
         cancelScheduledContinuation(sessionID);
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled)
         return;
@@ -38470,7 +38474,8 @@ var server = async ({ client }, options) => {
       const progressed = await recordToolProgress(sessionID, text, expectedAttemptID);
       if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
         locallyDeliveredPendingSessions.delete(sessionID);
-        cancelScheduledContinuation(sessionID);
+        if (!survivesProgress(scheduledContinuations.get(sessionID)?.purpose))
+          cancelScheduledContinuation(sessionID);
       }
     },
     async "chat.message"(input, output) {
@@ -38490,7 +38495,7 @@ var server = async ({ client }, options) => {
       const observed = await recordAssistantMessage(sessionID, latestAssistantMessage(output.messages), options ?? {});
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal);
       const scheduled = scheduledContinuations.get(sessionID);
-      if (observed.progressed && scheduled?.purpose !== "settle")
+      if (observed.progressed && !survivesProgress(scheduled?.purpose))
         cancelScheduledContinuation(sessionID);
     },
     async "experimental.chat.system.transform"(input, output) {
@@ -38511,7 +38516,7 @@ var server = async ({ client }, options) => {
       if (goal?.status === "active") {
         output.enabled = false;
         if (autoContinue)
-          scheduleSettledContinuation(input.sessionID, continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt), false, "recovery");
+          scheduleSettledContinuation(input.sessionID, continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt), false, "compaction");
       }
     },
     async event({ event }) {
@@ -38599,7 +38604,7 @@ var server = async ({ client }, options) => {
         const observed = await recordAssistantMessage(sessionID, message, options ?? {});
         await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal);
         const scheduled = scheduledContinuations.get(sessionID);
-        if (observed.progressed && scheduled?.purpose !== "settle")
+        if (observed.progressed && !survivesProgress(scheduled?.purpose))
           cancelScheduledContinuation(sessionID);
       }
       if (!isIdleEvent(event))
@@ -38820,7 +38825,7 @@ async function setupV2(context4) {
         await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, after3);
         const progressed = Boolean(after3 && (after3.lastAssistantMessageID !== (beforeProgress?.lastAssistantMessageID ?? "") || after3.lastAssistantText !== (beforeProgress?.lastAssistantText ?? "")));
         const queuedAfterProgress = scheduledContinuations.get(sessionID);
-        if (progressed && queuedAfterProgress?.purpose !== "settle")
+        if (progressed && !survivesProgress(queuedAfterProgress?.purpose))
           cancelScheduledContinuation(sessionID);
       }
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled)
@@ -39200,7 +39205,8 @@ async function setupV2(context4) {
     const progressed = await recordToolProgress(sessionID, text, expectedAttemptID);
     if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
       locallyDeliveredPendingSessions.delete(sessionID);
-      cancelScheduledContinuation(sessionID);
+      if (!survivesProgress(scheduledContinuations.get(sessionID)?.purpose))
+        cancelScheduledContinuation(sessionID);
     }
   }));
   registrations.push(await context4.session.hook("context", async (sessionContext) => {

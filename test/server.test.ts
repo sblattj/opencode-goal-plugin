@@ -3515,3 +3515,60 @@ test("update_goal_limits refuses to resume a plan-mode goal by raising limits", 
     requireTool(tools.update_goal_status, "update_goal_status").execute({ status: "active" }, planContext),
   ).rejects.toThrow("Plan mode")
 })
+
+// A compaction suppresses the session.idle that normally drives runAutoContinue,
+// so the timer scheduled by the compaction hook is the only thing left that can
+// reserve the next continuation. The model almost always resumes with output
+// straight after a compaction, and that output used to cancel the timer, leaving
+// the goal active with no stop reason and no continuation ever again.
+test("a compaction re-arm survives the model output that immediately follows it", async () => {
+  const calls: unknown[] = []
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool!
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going across a compaction" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+
+  const output = { enabled: true }
+  await hooks["experimental.compaction.autocontinue"]!({ sessionID: "ses_1" } as never, output)
+  expect(output.enabled).toBe(false)
+
+  // The agent resumes immediately: first a tool result, then assistant text.
+  // Both were cancellation signals for the old "recovery"-purposed re-arm.
+  await hooks["tool.execute.after"]?.(
+    { tool: "read", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "read", output: "resumed work after the compaction", metadata: {} } as never,
+  )
+  await hooks.event!({
+    event: {
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg_after_compaction",
+          role: "assistant",
+          sessionID: "ses_1",
+          time: { created: Date.now(), completed: Date.now() + 1 },
+        },
+      },
+    } as never,
+  })
+
+  // The re-arm must still fire and reserve the next continuation.
+  await waitForContinuation(calls)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+  const goal = await getGoal("ses_1")
+  expect(goal?.status).toBe("active")
+  expect(goal?.autoTurns).toBe(1)
+})

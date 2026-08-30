@@ -186,7 +186,25 @@ type TurnWatchdog = {
 
 type ScheduledContinuation = {
   timer: ReturnType<typeof setTimeout>
-  purpose: "settle" | "recovery" | "retry"
+  purpose: "settle" | "recovery" | "retry" | "compaction"
+}
+
+// Purposes a progressing turn must NOT cancel.
+//
+// "recovery" is a transport-dead timer: model output proves the transport came
+// back, so cancelling it on progress is correct and deliberate. The
+// post-compaction re-arm needs the exact opposite treatment, which is why it can
+// no longer share that purpose. Compaction suppresses the session.idle that
+// normally drives runAutoContinue, so the scheduled timer is the ONLY thing left
+// that can reserve the next continuation -- and the model almost always resumes
+// with output (usually a tool call) immediately after a compaction, which is
+// precisely the signal that cancels every non-"settle" purpose. The re-arm was
+// therefore destroyed by the same in-window output it existed to outlive,
+// stranding the goal with status "active", no stopReason, and budget remaining.
+const PROGRESS_SAFE_PURPOSES: ReadonlySet<ScheduledContinuation["purpose"]> = new Set(["settle", "compaction"])
+
+function survivesProgress(purpose: ScheduledContinuation["purpose"] | undefined) {
+  return purpose != null && PROGRESS_SAFE_PURPOSES.has(purpose)
 }
 
 function restrictedAgentSet(options?: Options) {
@@ -1249,7 +1267,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const observed = await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true)
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal)
       const queued = scheduledContinuations.get(sessionID)
-      if (observed.progressed && queued?.purpose !== "settle") cancelScheduledContinuation(sessionID)
+      if (observed.progressed && !survivesProgress(queued?.purpose)) cancelScheduledContinuation(sessionID)
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) return
       const current = await getGoalInternal(sessionID)
       if (!current) return
@@ -1630,7 +1648,13 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const progressed = await recordToolProgress(sessionID, text, expectedAttemptID)
       if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
         locallyDeliveredPendingSessions.delete(sessionID)
-        cancelScheduledContinuation(sessionID)
+        // Re-read rather than reuse `scheduled`: the await above can have
+        // replaced what is queued. A post-compaction re-arm reaches here only
+        // when a failure episode coincides with the compaction (the guard above
+        // otherwise returns early), and cancelling it would strand the goal
+        // exactly as before -- a tool call is the usual first output after a
+        // compaction, so this is the likeliest path to reach the re-arm at all.
+        if (!survivesProgress(scheduledContinuations.get(sessionID)?.purpose)) cancelScheduledContinuation(sessionID)
       }
     },
     async "chat.message"(input, output) {
@@ -1651,7 +1675,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const observed = await recordAssistantMessage(sessionID, latestAssistantMessage(output.messages), options ?? {})
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal)
       const scheduled = scheduledContinuations.get(sessionID)
-      if (observed.progressed && scheduled?.purpose !== "settle") cancelScheduledContinuation(sessionID)
+      if (observed.progressed && !survivesProgress(scheduled?.purpose)) cancelScheduledContinuation(sessionID)
     },
     async "experimental.chat.system.transform"(input, output) {
       if (typeof input.sessionID !== "string") return
@@ -1673,15 +1697,22 @@ const server: Plugin = async ({ client }, options?: Options) => {
         // Native autocontinue stays suppressed so the goal-specific
         // continuation prompt remains authoritative, but suppressing it also
         // suppresses the session.idle event that normally drives
-        // runAutoContinue. Schedule the recovery continuation here so the
-        // stranded awaitingContinuationProgress flag still gets cleared and the
-        // next continuation is reserved. Mirrors the session.error recovery path.
+        // runAutoContinue. Schedule the re-arm here so the stranded
+        // awaitingContinuationProgress flag still gets cleared and the next
+        // continuation is reserved.
+        //
+        // The purpose MUST be "compaction", not "recovery". This mirrors the
+        // session.error recovery path in shape only: a recovery timer is meant
+        // to die the moment the model produces output, and after a compaction
+        // the model produces output almost immediately, so scheduling this as
+        // "recovery" cancelled it before it could ever fire. See
+        // PROGRESS_SAFE_PURPOSES.
         if (autoContinue)
           scheduleSettledContinuation(
             input.sessionID,
             continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
             false,
-            "recovery",
+            "compaction",
           )
       }
     },
@@ -1787,7 +1818,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         const observed = await recordAssistantMessage(sessionID, message, options ?? {})
         await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal)
         const scheduled = scheduledContinuations.get(sessionID)
-        if (observed.progressed && scheduled?.purpose !== "settle") cancelScheduledContinuation(sessionID)
+        if (observed.progressed && !survivesProgress(scheduled?.purpose)) cancelScheduledContinuation(sessionID)
       }
 
       if (!isIdleEvent(event as never)) return
@@ -2009,7 +2040,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
               after.lastAssistantText !== (beforeProgress?.lastAssistantText ?? "")),
         )
         const queuedAfterProgress = scheduledContinuations.get(sessionID)
-        if (progressed && queuedAfterProgress?.purpose !== "settle") cancelScheduledContinuation(sessionID)
+        if (progressed && !survivesProgress(queuedAfterProgress?.purpose)) cancelScheduledContinuation(sessionID)
       }
       if (scheduled && scheduledContinuations.get(sessionID) !== scheduled) return
       const current = await getGoalInternal(sessionID)
@@ -2420,7 +2451,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       const progressed = await recordToolProgress(sessionID, text, expectedAttemptID)
       if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
         locallyDeliveredPendingSessions.delete(sessionID)
-        cancelScheduledContinuation(sessionID)
+        // Re-read rather than reuse `scheduled`: the await above can have
+        // replaced what is queued. A post-compaction re-arm reaches here only
+        // when a failure episode coincides with the compaction (the guard above
+        // otherwise returns early), and cancelling it would strand the goal
+        // exactly as before -- a tool call is the usual first output after a
+        // compaction, so this is the likeliest path to reach the re-arm at all.
+        if (!survivesProgress(scheduledContinuations.get(sessionID)?.purpose)) cancelScheduledContinuation(sessionID)
       }
     }),
   )

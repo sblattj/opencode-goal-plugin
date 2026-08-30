@@ -64,8 +64,7 @@ active goal with `awaitingContinuationProgress: true` but `pendingAttempt: null`
 compactions, and no errors anywhere.
 
 **The fix.** Keep the original intent — native autocontinue stays suppressed — but guarantee a trigger
-by scheduling a `"recovery"` continuation straight from the compaction hook, mirroring the
-`session.error` recovery pattern already in the same file:
+by scheduling a continuation straight from the compaction hook, under a purpose of its own:
 
 ```diff
      async "experimental.compaction.autocontinue"(input, output) {
@@ -78,7 +77,7 @@ by scheduling a `"recovery"` continuation straight from the compaction hook, mir
 +            input.sessionID,
 +            continuationDelayFromSnapshot(minInterval, goal.lastContinuationAt),
 +            false,
-+            "recovery",
++            "compaction",
 +          )
 +      }
      },
@@ -89,14 +88,27 @@ The scheduled timer fires `runAutoContinue()` once the turn settles, which clear
 stack on an existing scheduled continuation, and `reserveContinuation`'s `min_continue_interval` guard
 prevents a double-continue.
 
+**The purpose matters, and `0.2.0` through `0.3.0` got it wrong.** Those versions scheduled this re-arm
+as `"recovery"`. A `"recovery"` timer is a *transport-dead* timer: model output proves the transport came
+back, so every progress path cancels it on sight. After a compaction the model resumes almost immediately
+— usually with a tool call — so the re-arm was destroyed by the same in-window output it existed to
+outlive, and the goal stranded with `status: "active"`, `stopReason: null`, `autoTurns` frozen and budget
+remaining. `0.3.1` gives the re-arm its own `"compaction"` purpose, which the four progress-cancellation
+paths spare (`PROGRESS_SAFE_PURPOSES` in `src/server.ts`). The transport-dead timer is unchanged and
+still cancels on output.
+
 **Scope.** `src/server.ts` exports two implementations. `"experimental.compaction.autocontinue"` is
 registered only in the **v1** `server` export; `setupV2` never registers a compaction hook, so there is
 no equivalent bug on the OpenCode 2 path. The v1 path is the one that runs against OpenCode 1.x.
 
-**How far this is verified.** Unit tests, typecheck, lint, and `node --check` all pass, and the compiled
-`dist/server.js` contains the scheduled recovery call inside the compaction hook. A live goal surviving a
-real compaction end to end has **not** yet been observed and recorded. The change has not been submitted
-upstream, so upstream carries neither the fix nor any statement about this behaviour.
+**How far this is verified.** Unit tests, typecheck, lint and the build all pass, and a regression test
+drives the compaction hook followed by immediate tool and assistant output, asserting the continuation is
+still reserved; that test fails against the pre-`0.3.1` tree. The shipped `dist/server.js` was driven
+through the same scenario directly and compared against the shipped `0.3.0` bundle as a control: `0.3.0`
+emits zero continuations and leaves `autoTurns` at 0, `0.3.1` emits the continuation and advances it. A
+live goal surviving a real compaction inside a running OpenCode session over many hours has still **not**
+been observed end to end — that gap is what let the `"recovery"` purpose ship in `0.2.0`. The change has
+not been submitted upstream, so upstream carries neither the fix nor any statement about this behaviour.
 
 **Packaging changes.** The package is renamed to `@sblattj/opencode-goal-plugin` so a `bun add` of this
 fork no longer claims upstream's `node_modules/@prevalentware/opencode-goal-plugin` slot, and the
