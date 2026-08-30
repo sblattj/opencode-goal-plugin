@@ -1240,6 +1240,18 @@ const server: Plugin = async ({ client }, options?: Options) => {
     scheduledContinuations.set(sessionID, scheduled)
   }
 
+  // A bounded retry must not displace a progress-safe incumbent. Replacing a
+  // pending "compaction" or "settle" entry with a retry that any output can
+  // cancel re-strands exactly the goal the incumbent was armed to rescue: the
+  // resumed output cancels the retry, nothing is scheduled, and no idle is
+  // coming. The incumbent's own fire re-enters runAutoContinue, which schedules
+  // the retry then, once the map entry is free. Failure accounting is
+  // unaffected -- only the timer displacement is gated.
+  function scheduleBoundedRetry(sessionID: string, delayMs: number) {
+    if (survivesProgress(scheduledContinuations.get(sessionID)?.purpose)) return
+    scheduleSettledContinuation(sessionID, delayMs, true, "retry")
+  }
+
   async function runAutoContinue(
     sessionID: string,
     fromTaskDeferral = false,
@@ -1301,12 +1313,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         })
         if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
         if (autoContinue && afterFailure?.status === "active") {
-          scheduleSettledContinuation(
-            sessionID,
-            continuationRetryDelayMs(minInterval, attempt.reservedAt),
-            true,
-            "retry",
-          )
+          scheduleBoundedRetry(sessionID, continuationRetryDelayMs(minInterval, attempt.reservedAt))
         }
         return
       }
@@ -1368,12 +1375,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         // remaining minimum interval. Keep the reserved autoTurn consumed.
         const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures)
         if (autoContinue && afterFailure?.status === "active") {
-          scheduleSettledContinuation(
-            sessionID,
-            continuationRetryDelayMs(minInterval, attemptReservedAt),
-            true,
-            "retry",
-          )
+          scheduleBoundedRetry(sessionID, continuationRetryDelayMs(minInterval, attemptReservedAt))
         }
       } else {
         // Non-transport prompt errors (provider/config faults, aborts) are not
@@ -1788,12 +1790,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
               })
               if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
               if (autoContinue && afterFailure?.status === "active") {
-                scheduleSettledContinuation(
-                  sessionID,
-                  continuationRetryDelayMs(minInterval, attempt.reservedAt),
-                  true,
-                  "retry",
-                )
+                scheduleBoundedRetry(sessionID, continuationRetryDelayMs(minInterval, attempt.reservedAt))
               }
             } else if (autoContinue) {
               // No pending attempt: start the first bounded automatic recovery
@@ -2013,6 +2010,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     scheduledContinuations.set(sessionID, scheduled)
   }
 
+  // A bounded retry must not displace a progress-safe incumbent; see the v1
+  // twin of this helper for the full rationale.
+  function scheduleBoundedRetry(sessionID: string, delayMs: number) {
+    if (survivesProgress(scheduledContinuations.get(sessionID)?.purpose)) return
+    scheduleSettledContinuation(sessionID, delayMs, true, "retry")
+  }
+
   async function runAutoContinue(sessionID: string, fromTaskDeferral = false, scheduled?: ScheduledContinuation) {
     if (disposed) return
     if (busySessions.has(sessionID)) return
@@ -2080,12 +2084,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         })
         if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
         if (autoContinue && afterFailure?.status === "active") {
-          scheduleSettledContinuation(
-            sessionID,
-            continuationRetryDelayMs(minInterval, attempt.reservedAt),
-            true,
-            "retry",
-          )
+          scheduleBoundedRetry(sessionID, continuationRetryDelayMs(minInterval, attemptReservedAt))
         }
         return
       }
@@ -2137,12 +2136,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (isTransportError(error)) {
         const afterFailure = await recordContinuationResult(sessionID, "failure", maxPromptFailures)
         if (autoContinue && afterFailure?.status === "active") {
-          scheduleSettledContinuation(
-            sessionID,
-            continuationRetryDelayMs(minInterval, attemptReservedAt),
-            true,
-            "retry",
-          )
+          scheduleBoundedRetry(sessionID, continuationRetryDelayMs(minInterval, attemptReservedAt))
         }
       } else {
         await rollbackContinuationAttempt(sessionID)
@@ -2233,12 +2227,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
               })
               if (afterFailure) locallyDeliveredPendingSessions.delete(sessionID)
               if (autoContinue && afterFailure?.status === "active") {
-                scheduleSettledContinuation(
-                  sessionID,
-                  continuationRetryDelayMs(minInterval, attempt.reservedAt),
-                  true,
-                  "retry",
-                )
+                scheduleBoundedRetry(sessionID, continuationRetryDelayMs(minInterval, attempt.reservedAt))
               }
             } else if (autoContinue) {
               // No pending attempt: start the first bounded automatic recovery

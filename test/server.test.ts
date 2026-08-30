@@ -3636,3 +3636,68 @@ test("a compaction re-arm replaces a scheduled timer that would not survive prog
   expect(goal?.status).toBe("active")
   expect(goal?.autoTurns).toBe(1)
 })
+
+// 0.3.3 regression: a bounded retry must not displace a progress-safe
+// incumbent. The strand on the host shape that produced this bug: a compaction
+// lands mid-continuation (attempt pending) -> the re-arm is armed -> a
+// transport blip fails the attempt -> the error handler's retry (replace=true)
+// ate the re-arm -> the resumed output cancelled the retry -> nothing
+// scheduled, and no idle is coming.
+test("a bounded retry does not displace a pending compaction re-arm", async () => {
+  const calls: unknown[] = []
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 2 },
+  )
+  const tools = hooks.tool!
+  const context = { sessionID: "ses_retry_eat" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "survive the retry" }, context)
+
+  // 1. Idle drives continuation #1: delivered and pending, and it sets
+  //    lastContinuationAt so the re-arm below is armed ~2.5s out and the
+  //    pre-fix retry (had it been scheduled) ~2s out -- both well after the
+  //    cancel in step 4.
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_retry_eat" } } as never })
+  await waitForContinuation(calls)
+  expect(calls.length).toBe(1)
+
+  // 2. Compaction fires mid-continuation: the re-arm lands ("compaction").
+  const output = { enabled: true }
+  await hooks["experimental.compaction.autocontinue"]!({ sessionID: "ses_retry_eat" } as never, output)
+  expect(output.enabled).toBe(false)
+
+  // 3. A transport blip fails the pending attempt. Pre-0.3.3 this scheduled
+  //    the retry with replace=true, eating the re-arm.
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: {
+        sessionID: "ses_retry_eat",
+        error: { name: "AI_APICallError", message: "Cannot connect to API: The socket connection was closed unexpectedly." },
+      },
+    } as never,
+  })
+
+  // 4. The model resumes with a tool call, the usual first post-compaction
+  //    output. It cancels a "retry" on sight but must spare the "compaction"
+  //    re-arm. Pre-0.3.3 the re-arm was already gone, so this cancelled the
+  //    retry and nothing remained.
+  await hooks["tool.execute.after"]!(
+    { tool: "read", sessionID: "ses_retry_eat", callID: "call_1", args: {} } as never,
+    { title: "read", output: "resumed work after the compaction", metadata: {} } as never,
+  )
+
+  // 5. The re-arm fires and reserves the next continuation.
+  await waitForLong(() => calls.length === 2, 6000)
+  const goal = await getGoal("ses_retry_eat")
+  expect(goal?.status).toBe("active")
+  expect(goal?.autoTurns).toBe(2)
+})

@@ -14,6 +14,29 @@ The fork is consumed as a local file path and is **not published to npm**. There
 is no `@sblattj/opencode-goal-plugin` package; `dist/server.js` is committed and
 self-contained, and that file is the artifact.
 
+## [0.3.3] — 2026-08-30
+
+### Fixed
+
+- **A bounded retry could still eat the landed re-arm — `0.3.2` was necessary
+  but not sufficient.** `0.3.2` taught the compaction hook to replace whatever
+  was scheduled. But every bounded-retry path — `session.error` with a pending
+  attempt, and the two retry schedulings inside `runAutoContinue` — still
+  scheduled with `replace = true`, unconditionally displacing whatever was
+  queued. The strand on the host shape that produced this bug reads: a
+  compaction lands mid-continuation, so an attempt is pending; the re-arm is
+  armed; the transport blips; the error handler's retry replaces the re-arm;
+  the model resumes with output; and the output cancels the retry (`"retry"`
+  is not progress-safe). Nothing is scheduled, no `session.idle` is coming —
+  the same stranded signature as before: `active`, `stopReason: null`,
+  `autoTurns` frozen, budget and time remaining.
+
+  A bounded retry now refuses to displace a progress-safe incumbent
+  (`"compaction"` or `"settle"`): the incumbent's own fire re-enters
+  `runAutoContinue`, which schedules the retry then, once the map entry is
+  free. Failure accounting is unchanged — only the timer displacement is
+  gated.
+
 ## [0.3.2] — 2026-08-30
 
 ### Fixed
@@ -213,6 +236,8 @@ upstream `0aa2514`.
   npm, so a push-triggered run could only ever fail. Typecheck, lint and tests
   still run on every pull request via `ci.yml`.
 
+[0.3.3]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.3
+[0.3.2]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.2
 [0.3.1]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.1
 [0.3.0]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.0
 [0.2.1]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.2.1

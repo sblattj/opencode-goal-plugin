@@ -103,11 +103,19 @@ remaining. `0.3.1` gives the re-arm its own `"compaction"` purpose, which the fo
 paths spare (`PROGRESS_SAFE_PURPOSES` in `src/server.ts`). The transport-dead timer is unchanged and
 still cancels on output.
 
-**`0.3.1` was necessary but not sufficient, and `0.3.2` finishes it.** `0.3.1` kept scheduling the
+**`0.3.1` was necessary but not sufficient, and `0.3.2` makes the re-arm land.** `0.3.1` kept scheduling the
 re-arm with `replace = false`, so the whole fix was dropped whenever a continuation was already
 scheduled and the `"compaction"` purpose never reached the map. That is why the failure read as
 intermittent: the first compaction of a session lands on an empty schedule map and works, while a later
 one usually does not, so a session would survive one compaction and strand on the next.
+
+**`0.3.3` closes the last eater: a bounded retry no longer displaces a landed re-arm.** Every
+bounded-retry path still scheduled with `replace = true`, unconditionally displacing whatever was
+queued. The strand on the host shape that produced this bug: a compaction lands mid-continuation, the
+re-arm is armed, a transport blip fails the attempt, the error handler's retry replaces the re-arm, the
+model resumes with output, and the output cancels the retry — `"retry"` is not progress-safe. A retry
+now refuses to displace a progress-safe incumbent; the incumbent's own fire schedules the retry once
+the map entry is free (`scheduleBoundedRetry` in `src/server.ts`).
 
 **Scope.** `src/server.ts` exports two implementations. `"experimental.compaction.autocontinue"` is
 registered only in the **v1** `server` export; `setupV2` never registers a compaction hook, so there is
