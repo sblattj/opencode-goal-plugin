@@ -35,7 +35,10 @@ self-contained, and that file is the artifact.
   (`"compaction"` or `"settle"`): the incumbent's own fire re-enters
   `runAutoContinue`, which schedules the retry then, once the map entry is
   free. Failure accounting is unchanged — only the timer displacement is
-  gated.
+  gated. The fix is symmetric: a `scheduleBoundedRetry` helper landed in the
+  v1 closure and in `setupV2`, covering three retry sites in each — the
+  pending-attempt failure path and the transport-error catch inside
+  `runAutoContinue`, and the `session.error` handler.
 
 ## [0.3.2] — 2026-08-30
 

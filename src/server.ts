@@ -2452,11 +2452,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (progressed?.continuationFailures === 0 && progressed.pendingAttempt == null) {
         locallyDeliveredPendingSessions.delete(sessionID)
         // Re-read rather than reuse `scheduled`: the await above can have
-        // replaced what is queued. A post-compaction re-arm reaches here only
-        // when a failure episode coincides with the compaction (the guard above
-        // otherwise returns early), and cancelling it would strand the goal
-        // exactly as before -- a tool call is the usual first output after a
-        // compaction, so this is the likeliest path to reach the re-arm at all.
+        // replaced what is queued. setupV2 registers no compaction hook, so
+        // no "compaction" re-arm can exist here; the only progress-safe
+        // incumbent this spares is a "settle" timer coinciding with the
+        // failure episode, and cancelling it would strand the goal exactly
+        // as the v1 bug did. The v1 twin of this comment describes the
+        // compaction form of the same reasoning.
         if (!survivesProgress(scheduledContinuations.get(sessionID)?.purpose)) cancelScheduledContinuation(sessionID)
       }
     }),

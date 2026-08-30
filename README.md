@@ -115,11 +115,15 @@ queued. The strand on the host shape that produced this bug: a compaction lands 
 re-arm is armed, a transport blip fails the attempt, the error handler's retry replaces the re-arm, the
 model resumes with output, and the output cancels the retry — `"retry"` is not progress-safe. A retry
 now refuses to displace a progress-safe incumbent; the incumbent's own fire schedules the retry once
-the map entry is free (`scheduleBoundedRetry` in `src/server.ts`).
+the map entry is free (`scheduleBoundedRetry` in `src/server.ts`). The helper landed in both
+implementations — the v1 `server` export and `setupV2` — so bounded-retry behavior changed on the
+OpenCode 2 path as well.
 
 **Scope.** `src/server.ts` exports two implementations. `"experimental.compaction.autocontinue"` is
-registered only in the **v1** `server` export; `setupV2` never registers a compaction hook, so there is
-no equivalent bug on the OpenCode 2 path. The v1 path is the one that runs against OpenCode 1.x.
+registered only in the **v1** `server` export; `setupV2` never registers a compaction hook, so the
+compaction bug specifically has no v2 equivalent. The `0.3.3` retry guard, however, applies on both
+paths: a v2 retry could eat a v2 `"settle"` incumbent the same way, and `scheduleBoundedRetry` protects
+both. The v1 path is the one that runs against OpenCode 1.x.
 
 **How far this is verified.** Unit tests, typecheck, lint and the build all pass, and a regression test
 drives the compaction hook followed by immediate tool and assistant output, asserting the continuation is
@@ -261,7 +265,7 @@ OpenCode 2 rejects a path where it expects a package specifier, please
 
 OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint comes from `opencode.json`, while the sidebar and palette integration come from `~/.config/opencode/cli.json`.
 
-OpenCode 2 plugin APIs are still beta. This package pins its V2 development contract to the preview version above; later previews may require a compatible plugin update. V2 currently supports the goal command, tools, persistent state, usage accounting, idle continuation, Plan-mode safety, and TUI sidebar/palette integration. Goal-specific compaction context and recovery of already-running child sessions after a plugin restart remain V1-only because the current V2 plugin context does not expose equivalent hooks or history queries. This fork's compaction fix is likewise V1-only.
+OpenCode 2 plugin APIs are still beta. This package pins its V2 development contract to the preview version above; later previews may require a compatible plugin update. V2 currently supports the goal command, tools, persistent state, usage accounting, idle continuation, Plan-mode safety, and TUI sidebar/palette integration. Goal-specific compaction context and recovery of already-running child sessions after a plugin restart remain V1-only because the current V2 plugin context does not expose equivalent hooks or history queries. This fork's compaction fix is likewise V1-only; the `0.3.3` bounded-retry guard is the fork's first change to v2 scheduling behavior.
 
 ### Why A Bare `github:` Entry Does Not Work
 
@@ -571,6 +575,6 @@ OpenCode plugin modules are target-specific. This package exports separate modul
 }
 ```
 
-Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode idle events, including `session.idle` and `session.status` idle notifications. The optional `max_turn_time` watchdog can retry one goal continuation prompt when a model turn remains busy, without consuming the goal's auto-turn, no-progress, or prompt-failure budgets. By default, continuation is deferred while OpenCode Task child sessions are active or their terminal result still needs an orchestrator turn. During compaction, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative, and — in this fork — schedules its own recovery continuation so the goal is not stranded.
+Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode idle events, including `session.idle` and `session.status` idle notifications. The optional `max_turn_time` watchdog can retry one goal continuation prompt when a model turn remains busy, without consuming the goal's auto-turn, no-progress, or prompt-failure budgets. By default, continuation is deferred while OpenCode Task child sessions are active or their terminal result still needs an orchestrator turn. During compaction, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative, and — in this fork — schedules its own re-arm continuation so the goal is not stranded.
 
 The goal sidebar shows the current status, elapsed time, token usage, auto-continue count, latest checkpoint, latest status message, stop reason, and objective when a goal is active, paused, or safety-limited. Closed goals remain visible briefly through the latest tool state as achieved or unmet.
