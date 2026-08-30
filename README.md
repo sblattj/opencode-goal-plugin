@@ -286,6 +286,35 @@ path. Checked against OpenCode 1.18.23:
 `bun add github:sblattj/opencode-goal-plugin` **does** work — it is only OpenCode's own plugin
 resolver that cannot take either form. That is why Option 1 uses Bun to fetch and a file path to load.
 
+### Updating
+
+There is no `opencode plugin ... update`: the CLI's own installer cannot handle this fork
+(`opencode plugin github:sblattj/opencode-goal-plugin` fails with `git dep preparation failed`,
+checked against OpenCode 1.18.23). An update is just a re-resolution of the vendored dependency —
+`main`'s committed `dist/server.js` is the release artifact, and the `opencode.json` path into
+`node_modules` never changes, so nothing else needs touching:
+
+```bash
+bun add github:sblattj/opencode-goal-plugin
+```
+
+Then restart opencode. Verify what landed:
+
+```bash
+python3 -c 'import json;print(json.load(open("node_modules/@sblattj/opencode-goal-plugin/package.json"))["version"])'
+```
+
+Two constraints, both verified against Bun 1.3.14:
+
+- Do not re-add under a changed ref. Re-adding the dependency with a *different* `#tag` **or**
+  `#commit-sha` fails with a `DependencyLoop` resolution error (`Resolution: ...#1f03582` vs
+  `Dependency: ...#v0.3.3`) and silently leaves the old version installed. Re-adding the same
+  spec (the moving default branch) does not hit this — that is why Option 1 installs untagged.
+- To switch to a reviewed cut anyway, remove first, then add: `bun remove
+  @sblattj/opencode-goal-plugin && bun add
+  github:sblattj/opencode-goal-plugin#<tag-or-sha>`. Check
+  [Releases](https://github.com/sblattj/opencode-goal-plugin/releases) for the tag.
+
 ## Options
 
 In OpenCode 1, server options use the package-and-options tuple in `opencode.json`:
