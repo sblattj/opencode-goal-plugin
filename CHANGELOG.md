@@ -145,5 +145,6 @@ upstream `0aa2514`.
   npm, so a push-triggered run could only ever fail. Typecheck, lint and tests
   still run on every pull request via `ci.yml`.
 
+[0.3.0]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.0
 [0.2.1]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.2.1
 [0.2.0]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.2.0

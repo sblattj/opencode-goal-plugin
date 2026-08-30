@@ -35,7 +35,7 @@ bun run pack:dry-run
 
 ## Publishing Flow
 
-This fork publishes nothing to npm. `main` is the release: an install resolves whatever `dist/server.js` is committed there. The inherited `.github/workflows/publish.yml` still targets npm on every push to `main` and is inactive for this fork — there is no `@sblattj/opencode-goal-plugin` package and no Trusted Publisher configured for this repository.
+This fork publishes nothing to npm. `main` is the release: an install resolves whatever `dist/server.js` is committed there. `.github/workflows/publish.yml` is `workflow_dispatch` only and publishes nothing on its own — there is no `@sblattj/opencode-goal-plugin` npm package and no Trusted Publisher configured for this repository. Typecheck, lint and tests still run on every pull request via `ci.yml`.
 
 ## End-To-End Plugin Test
 
