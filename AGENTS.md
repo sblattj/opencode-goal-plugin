@@ -41,18 +41,56 @@ This fork publishes nothing to npm. `main` is the release: an install resolves w
 
 To test this plugin end to end, do not stop at unit tests. Run the local gates first: `bun run lint`, `bun run typecheck`, `bun run test`, `bun run build`, and `bun run pack:dry-run`.
 
-Then install the built tree in an isolated temp OpenCode project. OpenCode's `plugin` array takes neither `github:` nor a bare package name (both fail to resolve — see `HANDOFF.md` §4), so vendor it with Bun and point OpenCode at the file:
+Then install the built tree in a temp OpenCode project. OpenCode's `plugin` array takes neither `github:` nor a bare package name (both fail to resolve — see `HANDOFF.md` §4), so vendor it with Bun:
 
 ```bash
-cd "$(mktemp -d)" && echo '{"name":"smoke","version":"1.0.0"}' > package.json
+SMOKE="$(mktemp -d)"; ISO="$(mktemp -d)"; mkdir -p "$ISO/cfg"
+cd "$SMOKE" && echo '{"name":"smoke","version":"1.0.0"}' > package.json
 bun add github:sblattj/opencode-goal-plugin
-printf '{"plugin":["./node_modules/@sblattj/opencode-goal-plugin/dist/server.js"]}' > opencode.json
+cat > "$ISO/only.json" <<EOF
+{ "\$schema": "https://opencode.ai/config.json",
+  "plugin": ["$SMOKE/node_modules/@sblattj/opencode-goal-plugin/dist/server.js"] }
+EOF
 ```
 
-Run `opencode debug config` to confirm the entry resolves to a `file://` URL, then run a smoke test with an isolated state file, for example:
+**Do not write an `opencode.json` into the smoke project, and do not run bare `opencode`.**
+OpenCode's `plugin` array is a *union across every config source it finds*, so the run
+would load this build **and** whichever build the machine's global config points at — two
+plugins registering the same tool names, with the wrong one able to answer. A smoke test
+contaminated this way looks exactly like a clean one. Three sources have to be silenced,
+and each needs a different lever:
+
+| Source | Lever |
+| --- | --- |
+| `$XDG_CONFIG_HOME/opencode/opencode.json` | `XDG_CONFIG_HOME` pointed at an empty tree |
+| Whatever `$OPENCODE_CONFIG` names — **often already exported by a shell profile** | `OPENCODE_CONFIG` pointed at your own file (or `env -u`) |
+| A project `opencode.json` in the cwd | Do not create one; put the path in your config file instead |
+
+`OPENCODE_CONFIG_DIR` *adds* a source rather than redirecting one, and
+`OPENCODE_CONFIG_CONTENT` merges at local scope. Neither isolates.
+
+Prove the isolation before trusting the run — and read it from a **file**, because
+`opencode debug config` truncates at exactly 64 KiB through a pipe (its output embeds the
+resolved agent prompts), so piping it into `jq` or `python3` dies with a JSON error that
+reads like a broken command:
 
 ```bash
-OPENCODE_GOAL_STATE_PATH="/tmp/opencode-goal-plugin-smoke/goals.json" opencode run "/goal create a smoke-test goal and then report the current goal state"
+cd "$SMOKE"
+env OPENCODE_CONFIG="$ISO/only.json" XDG_CONFIG_HOME="$ISO/cfg" \
+  opencode debug config > "$ISO/cfg.json"
+python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(len(d["plugin"]),"plugin(s)");[print(" ",o["spec"],"<-",o["source"]) for o in d["plugin_origins"]]' "$ISO/cfg.json"
+```
+
+`plugin` must hold **exactly one** entry and `plugin_origins` must name your config as its
+source. Re-run without the two env vars as a control: it must come out *different* (the
+global build's path). If both look the same, the check cannot fail and proves nothing.
+
+Then run the smoke test with the same two variables plus an isolated state file:
+
+```bash
+env OPENCODE_CONFIG="$ISO/only.json" XDG_CONFIG_HOME="$ISO/cfg" \
+  OPENCODE_GOAL_STATE_PATH="$ISO/goals.json" \
+  opencode run "/goal create a smoke-test goal and then report the current goal state"
 ```
 
 The smoke test should show `create_goal` and `get_goal` tool calls and report an active goal. Inspect the state file afterward if you need to confirm JSON persistence.
