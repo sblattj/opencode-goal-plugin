@@ -103,6 +103,21 @@ const DEFAULT_COMMAND_NAME = "goal"
 const DEFAULT_RESTRICTED_AGENTS = ["plan"]
 const TASK_SETTLE_DELAY_MS = 25
 const SNAPSHOT_IDLE_HOLD_MS = 250
+// Poll cadence for a task-deferred session that has no snapshot-hold retryAt.
+// Only a snapshot hold ever produced one, so without this floor the common
+// block schedules nothing and no event is coming to re-open the question.
+const TASK_BLOCK_RECHECK_MS = 500
+// A terminal task whose orchestrator never reconciled it blocks for this long
+// after its FIRST terminal observation, then stops. Long enough that a real
+// orchestrator turn (seconds of generation) still wins the race and delivers
+// its own synthesis first; short enough that a stranded goal recovers.
+const TERMINAL_UNRECONCILED_GRACE_MS = 3_000
+// A task the tracker still believes is running blocks only while that belief is
+// backed by evidence this recent. A child session that never reports a terminal
+// status is otherwise unreachable: nothing reconciles, prunes, or ages it.
+const RUNNING_TASK_STALE_MS = 120_000
+// Consecutive non-transport send failures re-attempted before giving up.
+const NON_TRANSPORT_RETRY_LIMIT = 5
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 const STALE_PENDING_MS = 30_000
 const RETRY_SETTLE_MS = 25
@@ -171,6 +186,9 @@ type TaskRecord = {
   state: TaskState
   terminalUnreconciled: boolean
   terminalAt: number | null
+  // When this record last had positive evidence of being busy. A "running"
+  // state is only as trustworthy as this timestamp is fresh.
+  lastRunningAt: number | null
   lastAssistantMessageIDAtTerminal: string | null
 }
 
@@ -670,14 +688,36 @@ class TaskTracker {
 
   hasBlockingTasks(parentSessionID: string) {
     this.pruneExpiredSnapshotIdleHolds()
+    const now = Date.now()
     for (const task of this.tasks.values()) {
       if (task.parentSessionID !== parentSessionID) continue
-      if (task.state === "running" || task.terminalUnreconciled) return true
+      if (this.taskBlocks(task, now)) return true
     }
     for (const hold of this.snapshotIdleHolds.values()) {
       if (hold.parentSessionID === parentSessionID) return true
     }
     return false
+  }
+
+  // Blocking tasks with their ages, for a one-line deferral breadcrumb.
+  describeBlockingTasks(parentSessionID: string) {
+    const now = Date.now()
+    const blocking: Array<{ taskID: string; state: string; unreconciled: boolean; ageMs: number }> = []
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID !== parentSessionID || !this.taskBlocks(task, now)) continue
+      const since = task.state === "running" ? task.lastRunningAt : task.terminalAt
+      blocking.push({
+        taskID: task.taskID,
+        state: task.state,
+        unreconciled: task.terminalUnreconciled,
+        ageMs: since == null ? -1 : now - since,
+      })
+    }
+    for (const hold of this.snapshotIdleHolds.values()) {
+      if (hold.parentSessionID !== parentSessionID) continue
+      blocking.push({ taskID: hold.taskID, state: "snapshotIdle", unreconciled: false, ageMs: now - (hold.expiresAt - SNAPSHOT_IDLE_HOLD_MS) })
+    }
+    return blocking
   }
 
   nextSnapshotIdleRetryAt(parentSessionID: string) {
@@ -716,11 +756,18 @@ class TaskTracker {
     for (const childID of childIDs) {
       const status = statuses[childID]
       const statusType = isRecord(status) && typeof status.type === "string" ? status.type : undefined
-      if (statusType === "busy") this.markRunning(parentSessionID, childID)
-      else if (statusType === "idle") {
+      // The host removes a session from the status map the moment it goes idle,
+      // so a settled child is ABSENT from a map that was fetched successfully
+      // rather than reported "idle". Treating absence as anything other than a
+      // settle leaves this branch dead against a real host and lets a tracked
+      // child stay "running" for the life of the process.
+      if (statusType === "busy" || statusType === "retry") this.markRunning(parentSessionID, childID)
+      else if (statusType === "idle" || statusType === undefined) {
         if (this.tasks.has(childID)) this.markTerminal(childID, "completed", parentSessionID)
         else this.markSnapshotIdle(parentSessionID, childID)
       }
+      // Any other reported status is left alone: it is neither evidence of work
+      // in flight nor evidence that the child settled.
     }
   }
 
@@ -733,6 +780,7 @@ class TaskTracker {
       state: "running",
       terminalUnreconciled: false,
       terminalAt: null,
+      lastRunningAt: Date.now(),
       lastAssistantMessageIDAtTerminal: existing?.lastAssistantMessageIDAtTerminal ?? null,
     })
   }
@@ -748,22 +796,33 @@ class TaskTracker {
     const resolvedParentSessionID = existing?.parentSessionID ?? parentSessionID
     if (!resolvedParentSessionID) return
     this.clearSnapshotIdle(resolvedParentSessionID, taskID)
-    if (
-      existing &&
-      TASK_TERMINAL_STATES.has(existing.state) &&
-      !existing.terminalUnreconciled &&
-      !options.resetReconciled
-    ) {
-      return
-    }
+    // A repeat terminal observation on an already-terminal record is a status
+    // snapshot, not new evidence: a finished child keeps reporting idle on every
+    // poll. Re-writing the record would push terminalAt forward and re-capture
+    // the parent's current assistant id on each poll, so an age-based escape
+    // could never mature and the record would re-poison itself forever. Only the
+    // resetReconciled channels -- a Task tool result, a task-status message part
+    // -- carry genuinely new evidence and restart the clock.
+    if (existing && TASK_TERMINAL_STATES.has(existing.state) && !options.resetReconciled) return
     this.tasks.set(taskID, {
       taskID,
       parentSessionID: resolvedParentSessionID,
       state,
       terminalUnreconciled: true,
       terminalAt: Date.now(),
+      lastRunningAt: existing?.lastRunningAt ?? null,
       lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null,
     })
+  }
+
+  // Every block is bounded unless refreshed by positive evidence: a running
+  // record blocks while its running evidence is fresh, a terminal record blocks
+  // for the grace window after its first terminal observation. markRunning and
+  // markTerminal always stamp their timestamp, so a null is a shape that cannot
+  // be aged -- treat it as already expired rather than as a permanent block.
+  private taskBlocks(task: TaskRecord, now: number) {
+    if (task.state === "running") return task.lastRunningAt != null && now - task.lastRunningAt <= RUNNING_TASK_STALE_MS
+    return task.terminalUnreconciled && task.terminalAt != null && now - task.terminalAt <= TERMINAL_UNRECONCILED_GRACE_MS
   }
 
   private markSnapshotIdle(parentSessionID: string, taskID: string) {
@@ -1084,6 +1143,13 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const busySessions = new Set<string>()
   const nativeRetrySessions = new Set<string>()
   const locallyDeliveredPendingSessions = new Set<string>()
+  // Sessions whose current deferral streak already produced a log line. The
+  // gate re-checks every TASK_BLOCK_RECHECK_MS while blocked, so a per-poll
+  // line would bury the log; the marker is dropped when the gate passes or the
+  // session goes busy, making the next streak audible again.
+  const taskDeferralLoggedSessions = new Set<string>()
+  // Consecutive non-transport send failures per session, reset on any delivery.
+  const nonTransportFailures = new Map<string, number>()
   // Pending-attempt id captured at tool-call start, keyed by session+call id,
   // so a delayed tool output is only treated as progress for the attempt it
   // actually ran under. Entries are removed on execute.after, session deletion,
@@ -1116,6 +1182,23 @@ const server: Plugin = async ({ client }, options?: Options) => {
     return {
       blocked: taskTracker.hasBlockingTasks(sessionID),
       retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID),
+    }
+  }
+
+  async function logTaskDeferral(sessionID: string, recheckInMs: number) {
+    if (taskDeferralLoggedSessions.has(sessionID)) return
+    taskDeferralLoggedSessions.add(sessionID)
+    try {
+      await client.app?.log?.({
+        body: {
+          service: "opencode-goal-plugin",
+          level: "info",
+          message: "Auto-continue deferred while tasks are active",
+          extra: { recheckInMs: Math.max(0, recheckInMs), tasks: taskTracker.describeBlockingTasks(sessionID) },
+        },
+      })
+    } catch {
+      // Observability must never break the deferral path.
     }
   }
 
@@ -1270,11 +1353,20 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const taskStatus = await taskBlockStatus(sessionID)
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID)
-        if (taskStatus.retryAt != null) {
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null)
-        }
+        // No dead-stop: a block always leaves a scheduled re-check behind. Only
+        // a snapshot-idle hold ever produced a retryAt, and a real host never
+        // reports a settled child as idle, so the old "schedule only when
+        // retryAt is set" branch left the ordinary block with no timer and no
+        // event able to re-open the question -- the session simply stopped.
+        // Replace only when this call came from a timer, so the re-check chain
+        // can re-arm itself while an idle event still cannot displace an
+        // incumbent compaction re-arm (see the 0.3.2/0.3.3 rules above).
+        const recheckInMs = taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RECHECK_MS
+        await logTaskDeferral(sessionID, recheckInMs)
+        scheduleSettledContinuation(sessionID, recheckInMs, scheduled != null)
         return
       }
+      taskDeferralLoggedSessions.delete(sessionID)
       if (busySessions.has(sessionID)) return
       const observed = await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true)
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal)
@@ -1355,12 +1447,14 @@ const server: Plugin = async ({ client }, options?: Options) => {
       // marked it started (started=true is preserved).
       const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures)
       locallyDeliveredPendingSessions.add(sessionID)
+      nonTransportFailures.delete(sessionID)
       if (!delivered?.pendingAttempt?.delivered) {
         // The attempt was not present at delivery time (e.g. disposed mid-send):
         // do not leave a phantom reserved turn.
         await rollbackContinuationAttempt(sessionID)
       }
     } catch (error) {
+      let gaveUp = false
       if (disposed) {
         // The plugin was torn down while the prompt was in flight and the
         // prompt then failed: the reserved attempt was never delivered, so
@@ -1380,15 +1474,29 @@ const server: Plugin = async ({ client }, options?: Options) => {
       } else {
         // Non-transport prompt errors (provider/config faults, aborts) are not
         // transport or no-response failures: they do not increment the ceiling
-        // or auto-retry. Roll back the unconsumed reserved turn so it does not
-        // waste an auto-continue budget, and preserve useful error logging.
+        // or consume an auto-turn, so roll the unconsumed reserved turn back.
+        // They must not strand the goal in silence either. The retry is a plain
+        // "settle", not a bounded retry: the rollback leaves continuationFailures
+        // at 0 and pendingAttempt null, so a "retry"-purpose timer would no-op at
+        // fire time. It is capped at NON_TRANSPORT_RETRY_LIMIT consecutive
+        // failures so a deterministic fault stops instead of looping.
         await rollbackContinuationAttempt(sessionID)
+        const failures = (nonTransportFailures.get(sessionID) ?? 0) + 1
+        nonTransportFailures.set(sessionID, failures)
+        gaveUp = failures > NON_TRANSPORT_RETRY_LIMIT
+        if (autoContinue && !gaveUp && (await getGoalInternal(sessionID))?.status === "active") {
+          scheduleSettledContinuation(
+            sessionID,
+            continuationRetryDelayMs(minInterval, attemptReservedAt),
+            scheduled != null,
+          )
+        }
       }
       await client.app?.log?.({
         body: {
           service: "opencode-goal-plugin",
           level: "error",
-          message: "Auto-continue failed",
+          message: gaveUp ? "Auto-continue gave up after repeated non-transport failures" : "Auto-continue failed",
           extra: { error: error instanceof Error ? error.message : String(error) },
         },
       })
@@ -1408,6 +1516,13 @@ const server: Plugin = async ({ client }, options?: Options) => {
       locallyDeliveredPendingSessions.clear()
       nativeRetrySessions.clear()
       toolAttempts.clear()
+      taskDeferredSessions.clear()
+      taskDeferralLoggedSessions.clear()
+      nonTransportFailures.clear()
+      // activeContinuations is module scope, so an entry stranded by a client
+      // call that never settles outlives this plugin instance and silently kills
+      // auto-continue for that session in the next one.
+      activeContinuations.clear()
     },
     async config(config) {
       if (!registerCommand) return
@@ -1697,11 +1812,16 @@ const server: Plugin = async ({ client }, options?: Options) => {
       if (goal?.status === "active") {
         output.enabled = false
         // Native autocontinue stays suppressed so the goal-specific
-        // continuation prompt remains authoritative, but suppressing it also
-        // suppresses the session.idle event that normally drives
-        // runAutoContinue. Schedule the re-arm here so the stranded
-        // awaitingContinuationProgress flag still gets cleared and the next
-        // continuation is reserved.
+        // continuation prompt remains authoritative. The re-arm below is
+        // defense in depth, not a substitute for a missing event: suppressing
+        // autocontinue does NOT suppress session.idle. The host's turn loop
+        // simply finds nothing new queued and exits through the ordinary
+        // turn-end branch, and its runner publishes session.status(idle) and
+        // session.idle exactly as it does at the end of any other turn. What
+        // the re-arm buys is that the stranded awaitingContinuationProgress
+        // flag is cleared and the next continuation reserved even when that
+        // idle is missed, arrives before this hook's state write lands, or is
+        // consumed by a gate that later re-opens.
         //
         // The purpose MUST be "compaction", not "recovery". This mirrors the
         // session.error recovery path in shape only: a recovery timer is meant
@@ -1741,6 +1861,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
           if (status.type === "busy") {
             busySessions.add(sessionID)
             nativeRetrySessions.delete(sessionID)
+            taskDeferralLoggedSessions.delete(sessionID)
           }
           if (status.type === "busy") armTurnWatchdog(sessionID)
           if (status.type === "busy") await markPendingContinuationStarted(sessionID)
@@ -1814,6 +1935,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
         nativeRetrySessions.delete(sessionID)
         cancelScheduledContinuation(sessionID)
         taskDeferredSessions.delete(sessionID)
+        taskDeferralLoggedSessions.delete(sessionID)
+        nonTransportFailures.delete(sessionID)
         clearToolAttemptsForSession(toolAttempts, sessionID)
         taskTracker.observeSessionDeleted(sessionID)
       }
@@ -1870,6 +1993,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
   const activeContinuationsV2 = new Set<string>()
+  // Consecutive non-transport send failures per session, reset on any delivery.
+  const nonTransportFailures = new Map<string, number>()
   const latestStepBySession = new Map<string, V2StepRecord>()
   const stepTextBuffers = new Map<string, string>()
   const stepTokenSums = new Map<string, number>()
@@ -2026,14 +2151,24 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     try {
       const latestStep = latestStepBySession.get(sessionID)
       if (latestStep?.messageID) {
-        taskTracker.observeAssistantMessage(sessionID, { info: { id: latestStep.messageID, role: "assistant" } })
+        // Carry the cached completion timestamp. A bare {id, role} marker has no
+        // time, so messageCompletedAt reads null and the only timestamp V2 holds
+        // for reconciling a task is thrown away one line from where it was read.
+        taskTracker.observeAssistantMessage(sessionID, {
+          info: { id: latestStep.messageID, role: "assistant", time: { completed: latestStep.completedAt } },
+        })
       }
       const taskStatus = taskBlockStatus(sessionID)
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID)
-        if (taskStatus.retryAt != null) {
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null)
-        }
+        // See the V1 twin: a block always leaves a scheduled re-check behind, and
+        // replaces only when this call came from a timer so the chain can re-arm
+        // itself without an idle event displacing a compaction re-arm.
+        scheduleSettledContinuation(
+          sessionID,
+          taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RECHECK_MS,
+          scheduled != null,
+        )
         return
       }
       if (busySessions.has(sessionID)) return
@@ -2122,10 +2257,12 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       // here would refund an accepted prompt and allow a duplicate on idle.
       const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures)
       locallyDeliveredPendingSessions.add(sessionID)
+      nonTransportFailures.delete(sessionID)
       if (!delivered?.pendingAttempt?.delivered) {
         await rollbackContinuationAttempt(sessionID)
       }
     } catch (error) {
+      let gaveUp = false
       if (disposed) {
         // See the V1 catch block: torn down while the prompt was in flight, so
         // roll back the reserved undelivered attempt without counting a
@@ -2139,9 +2276,23 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           scheduleBoundedRetry(sessionID, continuationRetryDelayMs(minInterval, attemptReservedAt))
         }
       } else {
+        // See the V1 twin: a rolled-back attempt leaves no failure and no
+        // pending attempt behind, so it must re-attempt as a plain "settle"
+        // rather than strand, capped at NON_TRANSPORT_RETRY_LIMIT consecutive
+        // failures.
         await rollbackContinuationAttempt(sessionID)
+        const failures = (nonTransportFailures.get(sessionID) ?? 0) + 1
+        nonTransportFailures.set(sessionID, failures)
+        gaveUp = failures > NON_TRANSPORT_RETRY_LIMIT
+        if (autoContinue && !gaveUp && (await getGoalInternal(sessionID))?.status === "active") {
+          scheduleSettledContinuation(
+            sessionID,
+            continuationRetryDelayMs(minInterval, attemptReservedAt),
+            scheduled != null,
+          )
+        }
       }
-      v2ErrorLog("Auto-continue failed", error)
+      v2ErrorLog(gaveUp ? "Auto-continue gave up after repeated non-transport failures" : "Auto-continue failed", error)
     } finally {
       activeContinuationsV2.delete(sessionID)
     }
@@ -2255,6 +2406,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         if (scheduled) clearTimeout(scheduled.timer)
         scheduledContinuations.delete(sessionID)
         taskDeferredSessions.delete(sessionID)
+        nonTransportFailures.delete(sessionID)
         clearToolAttemptsForSession(toolAttempts, sessionID)
         taskTracker.observeSessionDeleted(sessionID)
         latestStepBySession.delete(sessionID)
@@ -2324,6 +2476,13 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
           const scheduled = scheduledContinuations.get(sessionID)
           if (scheduled?.purpose === "recovery") cancelScheduledContinuation(sessionID)
         }
+        // Feed the tracker the step's real completion time. session.step.started
+        // only ever supplies a step-START timestamp, so without this a task that
+        // settles while the closing step is still finishing can never satisfy
+        // the completedAt >= terminalAt half of reconciliation.
+        taskTracker.observeAssistantMessage(sessionID, {
+          info: { id: messageID, role: "assistant", time: { completed: event.created } },
+        })
         latestStepBySession.set(sessionID, {
           messageID,
           agent: latestStepBySession.get(sessionID)?.agent,
@@ -2512,6 +2671,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     locallyDeliveredPendingSessions.clear()
     watchdogRescuedSessions.clear()
     toolAttempts.clear()
+    taskDeferredSessions.clear()
+    nonTransportFailures.clear()
     for (const registration of registrations) await registration.dispose()
     // Best-effort termination of the event consumer. Never block plugin
     // unload on a stream that does not close promptly.

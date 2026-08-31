@@ -165,6 +165,15 @@ async function waitFor(predicate: () => boolean | Promise<boolean>) {
   expect(await predicate()).toBe(true)
 }
 
+async function waitForLong(predicate: () => boolean | Promise<boolean>, deadlineMs = 3000) {
+  const deadline = Date.now() + deadlineMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  expect(await predicate()).toBe(true)
+}
+
 function goalTool(mock: MockContext, name: string) {
   const tool = mock.tools.find((candidate) => candidate.name === name)
   if (!tool) throw new Error(`expected V2 tool ${name} to be registered`)
@@ -577,6 +586,108 @@ test("V2 idle continuation waits for a running child session", async () => {
 
   mock.stream.push({ type: "session.deleted", created: 102, data: { sessionID: "child" } })
   mock.stream.push({ type: "session.idle", created: 103, data: { sessionID: "ses_v2" } })
+  await waitFor(() => mock.promptCalls.length === 1)
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test(
+  "V2 a task settled against the closing step stops blocking once the grace expires",
+  async () => {
+    const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 1 })
+    const cleanup = await setupPlugin(mock as never)
+    await createGoalViaV2Tool(mock, "V2 fan-out must not strand")
+
+    const closingAt = Date.now() - 1000
+    mock.stream.push({
+      type: "session.step.started",
+      created: closingAt,
+      data: { sessionID: "ses_v2", assistantMessageID: "msg_closing", agent: "build" },
+    })
+    mock.stream.push({
+      type: "session.text.delta",
+      created: closingAt,
+      data: { sessionID: "ses_v2", assistantMessageID: "msg_closing", ordinal: 0, delta: "Synthesized the subagent results." },
+    })
+    mock.stream.push({
+      type: "session.step.ended",
+      created: closingAt,
+      data: {
+        sessionID: "ses_v2",
+        assistantMessageID: "msg_closing",
+        tokens: { input: 10, output: 40, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    })
+    await waitFor(async () => (await getGoal("ses_v2"))?.lastAssistantMessageID === "msg_closing")
+
+    // The task reports terminal after the closing step completed, so its
+    // terminalAt is strictly newer than every marker the tracker will ever hold.
+    await mock.hooks["execute.before"]!({ tool: "task", sessionID: "ses_v2", id: "call_1" })
+    await mock.hooks["execute.after"]!({
+      tool: "task",
+      sessionID: "ses_v2",
+      id: "call_1",
+      status: "completed",
+      result: { output: '<task id="t1" state="completed">done</task>' },
+    })
+
+    mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(mock.promptCalls).toHaveLength(0)
+
+    // No further step arrives, so only a bounded block can release this.
+    await waitForLong(() => mock.promptCalls.length === 1, 8000)
+
+    mock.stream.end()
+    await cleanup()
+  },
+  15000,
+)
+
+test("V2 a step.ended marker reconciles a task that settled inside the turn", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 1 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "V2 in-turn settle must reconcile")
+
+  mock.stream.push({
+    type: "session.step.started",
+    created: Date.now(),
+    data: { sessionID: "ses_v2", assistantMessageID: "msg_closing", agent: "build" },
+  })
+  mock.stream.push({
+    type: "session.text.delta",
+    created: Date.now(),
+    data: { sessionID: "ses_v2", assistantMessageID: "msg_closing", ordinal: 0, delta: "Synthesized the subagent results." },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 30))
+
+  // The task settles while the closing step is still finishing.
+  await mock.hooks["execute.before"]!({ tool: "task", sessionID: "ses_v2", id: "call_1" })
+  await mock.hooks["execute.after"]!({
+    tool: "task",
+    sessionID: "ses_v2",
+    id: "call_1",
+    status: "completed",
+    result: { output: '<task id="t1" state="completed">done</task>' },
+  })
+
+  // The step then ends with a real completion timestamp at or after the task's
+  // terminalAt, which is exactly the evidence that reconciles the record.
+  mock.stream.push({
+    type: "session.step.ended",
+    created: Date.now() + 1,
+    data: {
+      sessionID: "ses_v2",
+      assistantMessageID: "msg_closing",
+      tokens: { input: 10, output: 40, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  })
+  await waitFor(async () => (await getGoal("ses_v2"))?.lastAssistantMessageID === "msg_closing")
+
+  mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
+  // waitFor's 2000ms deadline is well inside the terminal-unreconciled grace, so
+  // a delivery here proves reconciliation rather than a block timing out.
   await waitFor(() => mock.promptCalls.length === 1)
 
   mock.stream.end()

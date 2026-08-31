@@ -37223,6 +37223,10 @@ var DEFAULT_COMMAND_NAME = "goal";
 var DEFAULT_RESTRICTED_AGENTS = ["plan"];
 var TASK_SETTLE_DELAY_MS = 25;
 var SNAPSHOT_IDLE_HOLD_MS = 250;
+var TASK_BLOCK_RECHECK_MS = 500;
+var TERMINAL_UNRECONCILED_GRACE_MS = 3000;
+var RUNNING_TASK_STALE_MS = 120000;
+var NON_TRANSPORT_RETRY_LIMIT = 5;
 var MAX_TIMER_DELAY_MS = 2147483647;
 var STALE_PENDING_MS = 30000;
 var RETRY_SETTLE_MS = 25;
@@ -37696,10 +37700,11 @@ class TaskTracker {
   }
   hasBlockingTasks(parentSessionID) {
     this.pruneExpiredSnapshotIdleHolds();
+    const now2 = Date.now();
     for (const task of this.tasks.values()) {
       if (task.parentSessionID !== parentSessionID)
         continue;
-      if (task.state === "running" || task.terminalUnreconciled)
+      if (this.taskBlocks(task, now2))
         return true;
     }
     for (const hold of this.snapshotIdleHolds.values()) {
@@ -37707,6 +37712,27 @@ class TaskTracker {
         return true;
     }
     return false;
+  }
+  describeBlockingTasks(parentSessionID) {
+    const now2 = Date.now();
+    const blocking = [];
+    for (const task of this.tasks.values()) {
+      if (task.parentSessionID !== parentSessionID || !this.taskBlocks(task, now2))
+        continue;
+      const since = task.state === "running" ? task.lastRunningAt : task.terminalAt;
+      blocking.push({
+        taskID: task.taskID,
+        state: task.state,
+        unreconciled: task.terminalUnreconciled,
+        ageMs: since == null ? -1 : now2 - since
+      });
+    }
+    for (const hold of this.snapshotIdleHolds.values()) {
+      if (hold.parentSessionID !== parentSessionID)
+        continue;
+      blocking.push({ taskID: hold.taskID, state: "snapshotIdle", unreconciled: false, ageMs: now2 - (hold.expiresAt - SNAPSHOT_IDLE_HOLD_MS) });
+    }
+    return blocking;
   }
   nextSnapshotIdleRetryAt(parentSessionID) {
     this.pruneExpiredSnapshotIdleHolds();
@@ -37743,9 +37769,9 @@ class TaskTracker {
     for (const childID of childIDs) {
       const status = statuses[childID];
       const statusType = isRecord2(status) && typeof status.type === "string" ? status.type : undefined;
-      if (statusType === "busy")
+      if (statusType === "busy" || statusType === "retry")
         this.markRunning(parentSessionID, childID);
-      else if (statusType === "idle") {
+      else if (statusType === "idle" || statusType === undefined) {
         if (this.tasks.has(childID))
           this.markTerminal(childID, "completed", parentSessionID);
         else
@@ -37762,6 +37788,7 @@ class TaskTracker {
       state: "running",
       terminalUnreconciled: false,
       terminalAt: null,
+      lastRunningAt: Date.now(),
       lastAssistantMessageIDAtTerminal: existing?.lastAssistantMessageIDAtTerminal ?? null
     });
   }
@@ -37773,17 +37800,22 @@ class TaskTracker {
     if (!resolvedParentSessionID)
       return;
     this.clearSnapshotIdle(resolvedParentSessionID, taskID);
-    if (existing && TASK_TERMINAL_STATES.has(existing.state) && !existing.terminalUnreconciled && !options.resetReconciled) {
+    if (existing && TASK_TERMINAL_STATES.has(existing.state) && !options.resetReconciled)
       return;
-    }
     this.tasks.set(taskID, {
       taskID,
       parentSessionID: resolvedParentSessionID,
       state,
       terminalUnreconciled: true,
       terminalAt: Date.now(),
+      lastRunningAt: existing?.lastRunningAt ?? null,
       lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null
     });
+  }
+  taskBlocks(task, now2) {
+    if (task.state === "running")
+      return task.lastRunningAt != null && now2 - task.lastRunningAt <= RUNNING_TASK_STALE_MS;
+    return task.terminalUnreconciled && task.terminalAt != null && now2 - task.terminalAt <= TERMINAL_UNRECONCILED_GRACE_MS;
   }
   markSnapshotIdle(parentSessionID, taskID) {
     const key = this.snapshotIdleKey(parentSessionID, taskID);
@@ -38045,6 +38077,8 @@ var server = async ({ client }, options) => {
   const busySessions = new Set;
   const nativeRetrySessions = new Set;
   const locallyDeliveredPendingSessions = new Set;
+  const taskDeferralLoggedSessions = new Set;
+  const nonTransportFailures = new Map;
   const toolAttempts = new Map;
   const watchdogRescuedSessions = new Set;
   const planAgents = restrictedAgentSet(options);
@@ -38067,6 +38101,21 @@ var server = async ({ client }, options) => {
       blocked: taskTracker.hasBlockingTasks(sessionID),
       retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID)
     };
+  }
+  async function logTaskDeferral(sessionID, recheckInMs) {
+    if (taskDeferralLoggedSessions.has(sessionID))
+      return;
+    taskDeferralLoggedSessions.add(sessionID);
+    try {
+      await client.app?.log?.({
+        body: {
+          service: "opencode-goal-plugin",
+          level: "info",
+          message: "Auto-continue deferred while tasks are active",
+          extra: { recheckInMs: Math.max(0, recheckInMs), tasks: taskTracker.describeBlockingTasks(sessionID) }
+        }
+      });
+    } catch {}
   }
   function clearTurnWatchdog(sessionID) {
     const watchdog = turnWatchdogs.get(sessionID);
@@ -38208,11 +38257,12 @@ var server = async ({ client }, options) => {
       const taskStatus = await taskBlockStatus(sessionID);
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID);
-        if (taskStatus.retryAt != null) {
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null);
-        }
+        const recheckInMs = taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RECHECK_MS;
+        await logTaskDeferral(sessionID, recheckInMs);
+        scheduleSettledContinuation(sessionID, recheckInMs, scheduled != null);
         return;
       }
+      taskDeferralLoggedSessions.delete(sessionID);
       if (busySessions.has(sessionID))
         return;
       const observed = await recordAssistantMessage(sessionID, latestAssistant, options ?? {}, true);
@@ -38280,10 +38330,12 @@ var server = async ({ client }, options) => {
       }
       const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures);
       locallyDeliveredPendingSessions.add(sessionID);
+      nonTransportFailures.delete(sessionID);
       if (!delivered?.pendingAttempt?.delivered) {
         await rollbackContinuationAttempt(sessionID);
       }
     } catch (error45) {
+      let gaveUp = false;
       if (disposed) {
         await rollbackContinuationAttempt(sessionID);
         return;
@@ -38295,12 +38347,18 @@ var server = async ({ client }, options) => {
         }
       } else {
         await rollbackContinuationAttempt(sessionID);
+        const failures2 = (nonTransportFailures.get(sessionID) ?? 0) + 1;
+        nonTransportFailures.set(sessionID, failures2);
+        gaveUp = failures2 > NON_TRANSPORT_RETRY_LIMIT;
+        if (autoContinue && !gaveUp && (await getGoalInternal(sessionID))?.status === "active") {
+          scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attemptReservedAt), scheduled != null);
+        }
       }
       await client.app?.log?.({
         body: {
           service: "opencode-goal-plugin",
           level: "error",
-          message: "Auto-continue failed",
+          message: gaveUp ? "Auto-continue gave up after repeated non-transport failures" : "Auto-continue failed",
           extra: { error: error45 instanceof Error ? error45.message : String(error45) }
         }
       });
@@ -38321,6 +38379,10 @@ var server = async ({ client }, options) => {
       locallyDeliveredPendingSessions.clear();
       nativeRetrySessions.clear();
       toolAttempts.clear();
+      taskDeferredSessions.clear();
+      taskDeferralLoggedSessions.clear();
+      nonTransportFailures.clear();
+      activeContinuations.clear();
     },
     async config(config3) {
       if (!registerCommand)
@@ -38536,6 +38598,7 @@ var server = async ({ client }, options) => {
           if (status.type === "busy") {
             busySessions.add(sessionID);
             nativeRetrySessions.delete(sessionID);
+            taskDeferralLoggedSessions.delete(sessionID);
           }
           if (status.type === "busy")
             armTurnWatchdog(sessionID);
@@ -38599,6 +38662,8 @@ var server = async ({ client }, options) => {
         nativeRetrySessions.delete(sessionID);
         cancelScheduledContinuation(sessionID);
         taskDeferredSessions.delete(sessionID);
+        taskDeferralLoggedSessions.delete(sessionID);
+        nonTransportFailures.delete(sessionID);
         clearToolAttemptsForSession(toolAttempts, sessionID);
         taskTracker.observeSessionDeleted(sessionID);
       }
@@ -38650,6 +38715,7 @@ async function setupV2(context4) {
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const activeContinuationsV2 = new Set;
+  const nonTransportFailures = new Map;
   const latestStepBySession = new Map;
   const stepTextBuffers = new Map;
   const stepTokenSums = new Map;
@@ -38809,14 +38875,14 @@ async function setupV2(context4) {
     try {
       const latestStep = latestStepBySession.get(sessionID);
       if (latestStep?.messageID) {
-        taskTracker.observeAssistantMessage(sessionID, { info: { id: latestStep.messageID, role: "assistant" } });
+        taskTracker.observeAssistantMessage(sessionID, {
+          info: { id: latestStep.messageID, role: "assistant", time: { completed: latestStep.completedAt } }
+        });
       }
       const taskStatus = taskBlockStatus(sessionID);
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID);
-        if (taskStatus.retryAt != null) {
-          scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now(), scheduled != null);
-        }
+        scheduleSettledContinuation(sessionID, taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RECHECK_MS, scheduled != null);
         return;
       }
       if (busySessions.has(sessionID))
@@ -38898,10 +38964,12 @@ async function setupV2(context4) {
       }
       const delivered = await recordContinuationResult(sessionID, "success", maxPromptFailures);
       locallyDeliveredPendingSessions.add(sessionID);
+      nonTransportFailures.delete(sessionID);
       if (!delivered?.pendingAttempt?.delivered) {
         await rollbackContinuationAttempt(sessionID);
       }
     } catch (error45) {
+      let gaveUp = false;
       if (disposed) {
         await rollbackContinuationAttempt(sessionID);
         return;
@@ -38913,8 +38981,14 @@ async function setupV2(context4) {
         }
       } else {
         await rollbackContinuationAttempt(sessionID);
+        const failures2 = (nonTransportFailures.get(sessionID) ?? 0) + 1;
+        nonTransportFailures.set(sessionID, failures2);
+        gaveUp = failures2 > NON_TRANSPORT_RETRY_LIMIT;
+        if (autoContinue && !gaveUp && (await getGoalInternal(sessionID))?.status === "active") {
+          scheduleSettledContinuation(sessionID, continuationRetryDelayMs(minInterval, attemptReservedAt), scheduled != null);
+        }
       }
-      v2ErrorLog("Auto-continue failed", error45);
+      v2ErrorLog(gaveUp ? "Auto-continue gave up after repeated non-transport failures" : "Auto-continue failed", error45);
     } finally {
       activeContinuationsV2.delete(sessionID);
     }
@@ -39018,6 +39092,7 @@ async function setupV2(context4) {
           clearTimeout(scheduled.timer);
         scheduledContinuations.delete(sessionID);
         taskDeferredSessions.delete(sessionID);
+        nonTransportFailures.delete(sessionID);
         clearToolAttemptsForSession(toolAttempts, sessionID);
         taskTracker.observeSessionDeleted(sessionID);
         latestStepBySession.delete(sessionID);
@@ -39092,6 +39167,9 @@ async function setupV2(context4) {
           if (scheduled?.purpose === "recovery")
             cancelScheduledContinuation(sessionID);
         }
+        taskTracker.observeAssistantMessage(sessionID, {
+          info: { id: messageID2, role: "assistant", time: { completed: event.created } }
+        });
         latestStepBySession.set(sessionID, {
           messageID: messageID2,
           agent: latestStepBySession.get(sessionID)?.agent,
@@ -39265,6 +39343,8 @@ async function setupV2(context4) {
     locallyDeliveredPendingSessions.clear();
     watchdogRescuedSessions.clear();
     toolAttempts.clear();
+    taskDeferredSessions.clear();
+    nonTransportFailures.clear();
     for (const registration of registrations)
       await registration.dispose();
     const termination = Promise.allSettled([consumer, eventIterator?.return?.()]);

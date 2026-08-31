@@ -1428,6 +1428,60 @@ test("synthetic terminal task message defers until orchestrator reconciles it", 
   expect(calls).toHaveLength(0)
 })
 
+test(
+  "a child that settles after the parent's closing message stops blocking once the grace expires",
+  async () => {
+    const calls: unknown[] = []
+    // The closing message completed a second ago, so the child's terminalAt is
+    // strictly newer than it and no refetch of that same message can ever
+    // reconcile the record: neither a different id nor completedAt >= terminalAt.
+    const closingCompletedAt = Date.now() - 1000
+    const closing = {
+      id: "msg_final",
+      role: "assistant",
+      time: { created: closingCompletedAt, completed: closingCompletedAt },
+      info: {
+        id: "msg_final",
+        role: "assistant",
+        sessionID: "ses_1",
+        time: { created: closingCompletedAt, completed: closingCompletedAt },
+      },
+      parts: [{ type: "text", text: "Synthesized the subagent results." }],
+    }
+    const hooks = await setupServer(
+      {
+        client: {
+          session: {
+            messages: async () => ({ data: [closing] }),
+            promptAsync: async (input: unknown) => {
+              calls.push(input)
+            },
+          },
+        },
+      } as never,
+      { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+    )
+    const tools = hooks.tool
+    if (!tools) throw new Error("expected goal tools to be registered")
+
+    await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+    await hooks.event!({
+      event: { type: "session.created", properties: { info: { id: "task_1", parentID: "ses_1" } } } as never,
+    })
+    await hooks.event!({ event: { type: "message.updated", properties: { info: closing.info } } as never })
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "task_1" } } as never })
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+    // Parent idle alone still does not fire a continuation.
+    expect(calls).toHaveLength(0)
+
+    // With no further external event of any kind, the block must still expire.
+    await waitForLong(() => calls.length === 1, 8000)
+    expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+  },
+  15000,
+)
+
 test("live child session status blocks goal continuation when task launch was missed", async () => {
   const calls: unknown[] = []
   const hooks = await setupServer(
@@ -1545,6 +1599,185 @@ test("tracked running child absent from live children stops blocking after grace
   expect(calls).toHaveLength(0)
   await waitForContinuation(calls)
   expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+})
+
+test(
+  "a child settled inside the block check stops blocking once the grace expires",
+  async () => {
+    const calls: unknown[] = []
+    let childStatus = "busy"
+    const closingCompletedAt = Date.now() - 1000
+    const closing = {
+      id: "msg_final",
+      role: "assistant",
+      time: { created: closingCompletedAt, completed: closingCompletedAt },
+      info: {
+        id: "msg_final",
+        role: "assistant",
+        sessionID: "ses_1",
+        time: { created: closingCompletedAt, completed: closingCompletedAt },
+      },
+      parts: [{ type: "text", text: "Synthesized the subagent results." }],
+    }
+    const hooks = await setupServer(
+      {
+        client: {
+          session: {
+            children: async () => ({ data: [{ id: "task_1" }] }),
+            status: async () => ({ data: { task_1: { type: childStatus } } }),
+            messages: async () => ({ data: [closing] }),
+            promptAsync: async (input: unknown) => {
+              calls.push(input)
+            },
+          },
+        },
+      } as never,
+      { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+    )
+    const tools = hooks.tool
+    if (!tools) throw new Error("expected goal tools to be registered")
+
+    await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+    await hooks.event!({ event: { type: "message.updated", properties: { info: closing.info } } as never })
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+    expect(calls).toHaveLength(0)
+
+    // The child settles during the block check itself, so the poisoned record is
+    // created after the closing message and carries its id. The status fake keeps
+    // reporting idle on every re-check poll: if a repeated snapshot could push
+    // terminalAt forward, the grace below would never mature.
+    childStatus = "idle"
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+    expect(calls).toHaveLength(0)
+
+    await waitForLong(() => calls.length === 1, 8000)
+    expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+  },
+  15000,
+)
+
+test(
+  "a tracked running child absent from the status map settles instead of blocking forever",
+  async () => {
+    const calls: unknown[] = []
+    // The host deletes a session from the status map the moment it goes idle, so
+    // a settled child is absent from a successfully fetched map rather than
+    // reported "idle".
+    let statuses: Record<string, unknown> = { task_1: { type: "busy" } }
+    const hooks = await setupServer(
+      {
+        client: {
+          session: {
+            children: async () => ({ data: [{ id: "task_1" }] }),
+            status: async () => ({ data: statuses }),
+            promptAsync: async (input: unknown) => {
+              calls.push(input)
+            },
+          },
+        },
+      } as never,
+      { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+    )
+    const tools = hooks.tool
+    if (!tools) throw new Error("expected goal tools to be registered")
+
+    await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+    expect(calls).toHaveLength(0)
+
+    statuses = {}
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+    expect(calls).toHaveLength(0)
+
+    await waitForLong(() => calls.length === 1, 8000)
+    expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+  },
+  15000,
+)
+
+test("a running task with stale running evidence stops blocking the goal", async () => {
+  const calls: unknown[] = []
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks["tool.execute.after"]?.(
+    { tool: "Task", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "Task", output: "task_id: task_1\nstate: running", metadata: {} } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  expect(calls).toHaveLength(0)
+
+  // A child that never reports a terminal status must not block for the life of
+  // the process. Timers do not fast-forward with the system clock, so the idle
+  // event drives the re-evaluation.
+  const realNow = Date.now()
+  try {
+    setSystemTime(new Date(realNow + 125_000))
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+    // setSystemTime freezes Date.now(), so this file's Date.now()-based waiters
+    // never reach their deadline while the clock is held forward. Timers still
+    // run on the real clock, so poll on timer ticks instead.
+    for (let tick = 0; tick < 500 && calls.length === 0; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(calls).toHaveLength(1)
+  } finally {
+    setSystemTime()
+  }
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+}, 15000)
+
+test("a task deferral logs one breadcrumb per streak, not per re-check", async () => {
+  const logs: unknown[] = []
+  const deferrals = () => logs.filter((entry) => JSON.stringify(entry).includes("Auto-continue deferred"))
+  const hooks = await setupServer(
+    {
+      client: {
+        app: { log: async (input: unknown) => logs.push(input) },
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks["tool.execute.after"]?.(
+    { tool: "Task", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "Task", output: "task_id: task_1\nstate: running", metadata: {} } as never,
+  )
+  for (let idle = 0; idle < 3; idle += 1) {
+    await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  }
+  // Long enough for at least two re-check polls to defer again.
+  await new Promise((resolve) => setTimeout(resolve, 1200))
+
+  expect(deferrals()).toHaveLength(1)
+  expect(JSON.stringify(deferrals()[0])).toContain("task_1")
+
+  // A busy episode ends the streak, so the next one is audible again.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(deferrals()).toHaveLength(2)
 })
 
 test("task deferral can be disabled with config", async () => {
@@ -2349,13 +2582,129 @@ test("non-transport prompt errors do not count toward the ceiling or auto-retry"
   await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_non_transport" } } as never })
   await new Promise((resolve) => setTimeout(resolve, 100))
 
-  // Non-transport failures are neither transport nor no-response: they must
-  // not increment the max_prompt_failures ceiling nor schedule an auto-retry,
-  // while preserving useful error logging.
-  expect(calls).toBe(1)
-  expect(logs).toHaveLength(1)
+  // Non-transport failures are neither transport nor no-response: they never
+  // increment the max_prompt_failures ceiling and never consume an auto-turn,
+  // while preserving useful error logging. The bounded re-attempt they now get
+  // instead of a silent strand is pinned by "consecutive non-transport send
+  // failures give up at the retry limit"; here it only has to stay bounded.
+  expect(calls).toBeGreaterThanOrEqual(1)
+  expect(calls).toBeLessThanOrEqual(6)
+  expect(logs.length).toBeGreaterThanOrEqual(1)
+  expect(JSON.stringify(logs[0])).toContain("Auto-continue failed")
   expect((await getGoal("ses_non_transport"))?.continuationFailures).toBe(0)
+  expect((await getGoal("ses_non_transport"))?.autoTurns).toBe(0)
   expect((await getGoal("ses_non_transport"))?.status).toBe("active")
+})
+
+test("a non-transport send failure retries instead of stranding the goal", async () => {
+  const calls: unknown[] = []
+  let thrown = 0
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            if (thrown === 0) {
+              thrown += 1
+              throw new Error("agent not found")
+            }
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 3, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  await waitForContinuation(calls)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+  // A rolled-back attempt is not a transport failure, so the ceiling is untouched.
+  expect((await getGoal("ses_1"))?.continuationFailures).toBe(0)
+})
+
+test("consecutive non-transport send failures give up at the retry limit", async () => {
+  let attempts = 0
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {
+            attempts += 1
+            throw new Error("agent not found")
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  // One initial delivery plus NON_TRANSPORT_RETRY_LIMIT retries, then silence.
+  await waitForLong(() => attempts >= 6, 8000)
+  const settled = attempts
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  expect(attempts).toBe(settled)
+  expect(attempts).toBe(6)
+  expect((await getGoal("ses_1"))?.status).toBe("active")
+  expect((await getGoal("ses_1"))?.continuationFailures).toBe(0)
+}, 15000)
+
+test("dispose releases the active-continuation guard for the next plugin instance", async () => {
+  const calls: unknown[] = []
+  const stranded = await setupServer(
+    {
+      client: {
+        session: {
+          // A client call that never settles strands runAutoContinue inside the
+          // module-level activeContinuations guard, before any attempt is
+          // reserved.
+          messages: () => new Promise(() => {}),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const strandedTools = stranded.tool
+  if (!strandedTools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(strandedTools.create_goal, "create_goal").execute(
+    { objective: "keep going" },
+    { sessionID: "ses_1" } as never,
+  )
+  void stranded.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(calls).toHaveLength(0)
+
+  await stranded.dispose!()
+
+  const revived = await setupServer(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  await revived.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  await waitForContinuation(calls)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
 })
 
 test("session.error without a pending attempt schedules recovery without a phantom failure", async () => {
