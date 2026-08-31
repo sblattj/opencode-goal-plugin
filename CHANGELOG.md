@@ -14,6 +14,81 @@ The fork is consumed as a local file path and is **not published to npm**. There
 is no `@sblattj/opencode-goal-plugin` package; `dist/server.js` is committed and
 self-contained, and that file is the artifact.
 
+## [0.3.4] — 2026-08-30
+
+### Fixed
+
+- **The task-deferral gate could dead-stop with no way back — confirmed — but not for the
+  reason it was reported.** A dogfooding session (opencode host `1.18.19`, plugin `0.3.3`) ran
+  roughly four hours across ~10.8M tokens with `autoTurns` frozen at 0 the entire time — every
+  continuation was a human typing "continue". The report attributed it to a `Task` child that
+  captures the parent's own closing assistant message as its terminal marker and then finds
+  nothing newer to reconcile against, permanently. Verification refutes that mechanism as
+  stated: `assistantReconcilesTask` reconciles on *either* a different message id or
+  `completedAt >= terminalAt`, which is exactly the case the report's own scenario hits —
+  ordinary parallel fan-out, where a child settles mid-turn or against the still-streaming
+  closing message, heals on the very next idle. What is real, and worse: `taskBlockStatus` can
+  report `blocked` with `retryAt: null` — no snapshot-idle hold exists — and the gate's own
+  deferral branch scheduled **nothing** in that case. `retryAt` turns out to be null far more
+  often than the code implies, because the host deletes an idled session from its own status
+  map the moment it goes idle, so the snapshot-idle-hold path that would otherwise have
+  produced a real `retryAt` almost never engages against a live host. The failure family behind
+  the same symptom is wider than the one reported: a tracked task record stuck at
+  `state: "running"` that no host event was ever going to clear, `activeContinuations`
+  (module-level, leaking across `dispose` in the v1 path only) permanently gating a session id,
+  and a non-transport `promptAsync` failure that rolled back its reservation and armed no
+  retry — each produces the identical `autoTurns: 0`, `pendingAttempt: null` signature, with no
+  timer anywhere and no distinguishing evidence short of reading the goal's own history.
+
+- **Two invariants now hold everywhere the gate is evaluated: it never defers without
+  scheduling a re-check, and no block outlives a bound unless something genuinely refreshes
+  it.** `runAutoContinue`'s deferral branch always schedules a settled continuation now — the
+  real `retryAt` when a snapshot hold supplies one, a fixed poll cadence when it does not — so
+  `blocked` can no longer mean "and nothing will ever look again." Independently, no reason to
+  block lasts forever: a `terminalUnreconciled` record stops blocking a fixed grace period after
+  it was first observed terminal, and a `running` record stops blocking once its last
+  confirmed-busy evidence goes stale. A repeated status-snapshot observation of the same state
+  is explicitly *not* new evidence for either clock — only the tool-output and
+  message-observation channels that already pass `resetReconciled: true` restart it. That
+  distinction mattered in practice: `markTerminal` previously rewrote `terminalAt` on every
+  repeated idle observation of an already-unreconciled record, so an age-based escape would
+  never have expired against a child that keeps reporting idle on every poll. It now returns
+  without rewriting when the existing record is already terminal-and-unreconciled and the
+  caller isn't asserting fresh evidence.
+
+- **A settled child that disappears from the host's status map is now recognized as settled,
+  not silently ignored.** The host deletes an idled session from its status map rather than
+  reporting it idle, so a child present in `session.children` but absent from a
+  successfully-fetched status map is now read as evidence the child went idle instead of being
+  left untouched. A failed or missing status fetch still changes nothing, as before.
+
+- **v2 parity and real timestamps.** The `session.step.ended` handler now feeds the tracker a
+  real-timestamp assistant marker instead of a bare id, and the v2 pre-check marker carries the
+  cached step-completion timestamp it already had instead of discarding it. The gate fix above
+  applies to `setupV2`'s continuation path the same way it applies to v1's.
+
+- **Dispose hygiene.** `activeContinuations` is module-level and shared across every session; v1
+  `dispose` never cleared it while v2's did. A hung in-flight call could leave a session id
+  permanently gated behind that check, surviving even a plugin reload. v1 `dispose` now clears
+  it along with the same bookkeeping sets v2 already clears.
+
+- **Non-transport send failures stop stranding silently.** A rollback from a non-transport
+  delivery failure (a bad agent name, a 4xx, a state-file write error) previously logged and
+  armed nothing. It now retries with a bounded, per-session consecutive-failure counter (five
+  attempts) before giving up and logging once; any successful delivery resets the counter.
+
+- **A deferral breadcrumb.** Each *streak* of gate deferrals — not each poll — now logs once,
+  naming the blocking task ids, their states and ages, and the chosen recheck delay, through the
+  same channel the existing "Auto-continue failed" line uses. The streak marker clears the
+  moment the gate passes or the session goes busy.
+
+The three tests the original `TaskTracker` design pinned this invariant against —
+`test/server.test.ts:1295`, `:1340`, `:1393`, all asserting that a parent's own idle does not by
+itself fire continuation while a task is terminal-unreconciled — pass unmodified. The grace
+period introduced here is the deliberate, bounded narrowing that invariant was always going to
+need: wait for genuine orchestrator reconciliation for a few seconds, then stop waiting, rather
+than wait forever with no way back.
+
 ## [0.3.3] — 2026-08-30
 
 ### Fixed
@@ -239,6 +314,7 @@ upstream `0aa2514`.
   npm, so a push-triggered run could only ever fail. Typecheck, lint and tests
   still run on every pull request via `ci.yml`.
 
+[0.3.4]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.4
 [0.3.3]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.3
 [0.3.2]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.2
 [0.3.1]: https://github.com/sblattj/opencode-goal-plugin/releases/tag/v0.3.1

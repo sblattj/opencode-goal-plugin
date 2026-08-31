@@ -1,6 +1,6 @@
 {
   "name": "@sblattj/opencode-goal-plugin",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "OpenCode goal plugin that adds Codex-style long-running goal mode, /goal commands, persistence, and TUI status for AI coding agents. Fork of @prevalentware/opencode-goal-plugin (MIT) carrying the post-compaction auto-continuation fix.",
   "keywords": [
     "opencode",

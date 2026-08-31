@@ -3,7 +3,11 @@
 **Repo:** `sblattj/opencode-goal-plugin` (**public** since 2026-08-28; it was created private)
 **Upstream:** `prevalentWare/opencode-goal-plugin` (MIT) — kept as the `upstream` git remote
 **Created:** 2026-08-28
-**Status:** **the fix is APPLIED, built, and shipped to `main`** (`e4adfab`, 2026-08-28), and OpenCode on this host is wired to it. What remains is the optional upstream PR and a live behavioural confirmation — see §6.
+**Status:** **the compaction-recovery fix is APPLIED, built, and shipped to `main`** (`e4adfab`,
+2026-08-28), and OpenCode on this host is wired to it. What remains for that fix is the optional
+upstream PR and a live behavioural confirmation — see §6. **A second, independent stranding
+mechanism — a task-deferral gate that could dead-stop auto-continue with no compaction
+involved — was diagnosed and fixed in `0.3.4`. See §9.**
 
 This is a **hard fork**, not a GitHub fork. It was created private, and GitHub forks of a public repo
 cannot be made private, so the history was cloned and pushed to a fresh repo (`isFork=false`). The repo
@@ -21,7 +25,7 @@ The plugin deliberately suppresses OpenCode's native post-compaction "continue" 
 goal-specific continuation prompt stays authoritative. In this tree that is:
 
 ```ts
-// src/server.ts:1422-1425
+// src/server.ts — the "experimental.compaction.autocontinue" hook (v1 `server` export)
 async "experimental.compaction.autocontinue"(input, output) {
   const goal = await getGoal(input.sessionID)
   if (goal?.status === "active") output.enabled = false
@@ -41,6 +45,25 @@ an active goal with `awaitingContinuationProgress: true` but `pendingAttempt: nu
 frozen at 1 across ~9 minutes of real work and logged checkpoints, `lastAssistantMessageID` ahead of
 `continuationBaselineMessageID` (so work *had* happened), ~4.97M tokens used (many compactions), and
 no errors anywhere.
+
+**Correction (2026-08-30):** the premise in the paragraph above — that suppressing OpenCode's
+native post-compaction continue (`output.enabled = false`) also suppresses the `session.idle`
+event — is **host-traced FALSE**. Traced end to end against opencode's own source: the compaction
+task's loop-exit lives in `session/compaction.ts`, whose `enabled: false` branch simply skips
+adding a synthetic continuation message and falls through to `"continue"`; back in
+`session/prompt.ts`'s turn loop, with nothing new queued the ordinary turn-exit condition fires on
+the very next check — the same branch that ends *any* normal turn; and the runner's own
+`onExit`/`finishRun` path (`session/run-state.ts` → `effect/runner.ts`) publishes `session.status`
+(idle) and the legacy `session.idle` exactly as it does after every other turn, compaction or not.
+Disabling native autocontinue removes only the extra in-window continuation turn; it never touches,
+gates, or bypasses idle publishing. So the 0.2.0 recovery re-arm this section documents, and the
+0.3.1–0.3.3 fixes that hardened it (purpose bookkeeping, replace semantics, bounded-retry
+displacement — see CHANGELOG), remain real and are **not reverted or weakened** by this
+correction: they fixed genuine bugs in the recovery-timer mechanism 0.2.0 introduced. What is
+corrected is only the *reason it was believed necessary* — and, more importantly, the belief that
+compaction-purpose bookkeeping was the *sole* stranding mechanism for auto-continue. It was not:
+`0.3.4` found and fixed a second, unrelated stranding family in the task-deferral gate that strands
+auto-continue on ordinary idle boundaries, with no compaction involved at all. See §9.
 
 ## 2. The fix (applied in `e4adfab`)
 
@@ -130,8 +153,8 @@ error: github:sblattj/opencode-goal-plugin failed to resolve
 That half is fixed: now that the repo is public, `bun add github:sblattj/opencode-goal-plugin`
 succeeds and installs the built bundle.
 
-But OpenCode's own plugin resolver still cannot take it (verified on OpenCode 1.18.23,
-2026-08-28). `"plugin": ["github:sblattj/opencode-goal-plugin"]` is accepted into the
+But OpenCode's own plugin resolver still cannot take it (verified on OpenCode 1.18.19,
+2026-08-28 — corrected 2026-08-30 from a mistaken 1.18.23; see the version-history note in §9). `"plugin": ["github:sblattj/opencode-goal-plugin"]` is accepted into the
 resolved config and then produces
 `~/.cache/opencode/packages/github:sblattj/opencode-goal-plugin/` containing only a
 partial dependency tree — no `package.json`, no installed package, no `dist/server.js`.
@@ -191,14 +214,34 @@ global `goals.json`). `find ~/.local/share/opencode-goal-plugin -name 'goals.jso
 ### Scope note the original handoff missed: v1 vs v2
 
 `src/server.ts` exports two implementations — `export default { id, server, setup: setupV2 }`.
-`"experimental.compaction.autocontinue"` is registered **only** in the v1 `server`
-(`src/server.ts:919-1537`); `setupV2` (1547-2196) registers tool/session hooks and an event
-subscription and never registers a compaction hook, so there is no equivalent bug there.
-Which one runs matters, and it resolves cleanly: the package's runtime dependency is
-`@opencode-ai/plugin ^1.17.1` and the host runs OpenCode **1.18.23**, while `setupV2` is
-written against `@opencode-ai/plugin-v2` — a `0.0.0-next-17055` prerelease kept only as a
-devDependency. The v1 path is the live one, which also matches the original bug report
-("does not keep working after compaction in opencode v1").
+`"experimental.compaction.autocontinue"` is registered **only** in the v1 `server` export;
+`setupV2` registers tool/session hooks and an event subscription and never registers a
+compaction hook, so there is no equivalent bug there. Which one runs matters, and it resolves
+cleanly — but not for the reason originally given here.
+
+**Correction (2026-08-30):** the original version of this note argued the v1 path is live
+because the package's runtime dependency is `@opencode-ai/plugin ^1.17.1` while `setupV2` is
+written against `@opencode-ai/plugin-v2`, a prerelease kept only as a devDependency, and cited
+the host as OpenCode **1.18.23**. Both the host version and the mechanism were wrong. The host
+measured directly (a dogfooding session, 2026-08-30) runs **1.18.19**, and the real mechanism —
+traced against opencode's own plugin loader source, not inferred from `package.json` — is the
+**loader**, not the dependency graph: OpenCode's legacy plugin loader reads only `mod.default`,
+detects the shape `{id, server, tui}`, and invokes `.server` — it never reads `.setup`
+(`readV1Plugin` in opencode's `plugin/shared.ts`, called from `applyPlugin` in
+`plugin/index.ts`). A plain string entry in the config's `plugin` array — the form this fork's
+README instructs — always resolves and loads with `kind: "server"`, which is exactly the code
+path that ignores `.setup`. `.setup` is read only by a second, independent loader — the
+always-on v2 "config-plugin" loader (`packages/core/src/config/plugin/external.ts`) that boots
+unconditionally on every location, not behind any version gate. That loader *does* re-import
+this exact `dist/server.js` a second time and does attempt to decode it against its own schema
+(`{id, effect}` or `{id, setup}`), but the module only exports `{id, server, tui}`, so the
+decode fails and the whole per-plugin attempt is silently swallowed
+(`Effect.ignoreCause`) — no v2 hook registration happens, and no error surfaces anywhere a
+plugin author would see it. Net effect matches the original note's conclusion (`setupV2` is
+unreachable, v1 `server` is the live export) — the dependency-version argument just never
+established it; it happened to land on the right answer by an unverified route. Two entrypoint
+imports per location boot, one of which always no-ops for this plugin, is worth knowing if
+`dist/server.js` ever grows import-time side effects.
 
 ---
 
@@ -206,7 +249,7 @@ devDependency. The v1 path is the live one, which also matches the original bug 
 |---|---|
 | This repo | `sblattj/opencode-goal-plugin` (public, hard fork) |
 | Upstream | `prevalentWare/opencode-goal-plugin` (MIT), remote `upstream` |
-| File edited | `src/server.ts` — hook at **1422-1425** (v1 `server` export only) |
+| File edited | `src/server.ts` — the `"experimental.compaction.autocontinue"` hook (v1 `server` export only) |
 | Build | `bun run build` → `dist/server.js` (must be committed here) |
 | Wire-up | local file path — OpenCode's `plugin` array takes neither `github:` nor a bare package name |
 | State file | `~/.local/share/opencode-goal-plugin/goals.json` |
@@ -225,8 +268,10 @@ session with no goal — asks questions exactly as before. README documents it u
 
 ### What was proven, and how
 
-The design turned on two questions about opencode 1.18.23 that could not be answered from the
-plugin API types. Both were settled against the shipped binary and a live run, not inferred.
+The design turned on two questions about opencode 1.18.19 (misreported as 1.18.23 when this
+section was written; corrected 2026-08-30, see the version-history note in §9) that could not
+be answered from the plugin API types. Both were settled against the shipped binary and a live
+run, not inferred.
 
 1. **Throwing from `tool.execute.before` is safe and the message reaches the model.** The bundle's
    hook dispatcher has no try/catch (`for (let H of B.hooks) { ... yield* v.promise(async () => V(K,U)) }`),
@@ -317,3 +362,82 @@ those dependencies resolved from a package manifest.
 
 `@opencode-ai/plugin` stays external because it is type-only — it does not appear in the bundle's
 imports at all.
+
+---
+
+## 9. Task-reconciliation deadlock diagnosed and fixed (2026-08-30, `0.3.4`)
+
+**Version-history note.** §4, the old §6 scope note, and §7 all previously cited the host as
+OpenCode **1.18.23**. A 2026-08-30 dogfooding session measured the actual host binary directly:
+it is **1.18.19**. All three citations above have been corrected in place; this is the note they
+point back to.
+
+**The report.** The same dogfooding session (opencode `1.18.19`, plugin `0.3.3`) ran a goal whose
+turns spawned parallel `Task` subagents for roughly four hours across ~10.8M tokens. `autoTurns`
+never left 0 — every continuation across the whole session was a human typing "continue," with
+`lastContinuationAt: null`, `pendingAttempt: null`, and no errors logged. The report diagnosed a
+`terminalUnreconciled` "reconciliation deadlock": a `Task` child settling terminal against the
+parent's own *final* assistant message for the turn, then finding nothing newer to reconcile
+against, forever — and proposed treating the parent's own `session.idle` as proof the turn was
+settled.
+
+**Adversarial verification (read-only, this repo + the opencode host source) refuted the reported
+mechanism as stated, while confirming a real and worse defect underneath it.** Reconciliation in
+`TaskTracker` fires on *either* a different assistant-message id than the one captured at terminal
+time *or* `completedAt >= terminalAt` — not "a newer message," which is what the report assumed.
+That means the report's own scenario — an ordinary parallel fan-out, where a child settles against
+the still-streaming closing message or mid-turn — is exactly the case that already reconciles,
+either immediately or on `runAutoContinue`'s own pre-gate refetch (which already re-fetches and
+re-observes the latest assistant message before every gate check — the report's proposed fix was
+already, in effect, implemented). The "human `continue` unsticks it" evidence the report leaned on
+also does not discriminate: a human prompt bypasses the plugin's gate entirely, so *any* candidate
+mechanism recovers on human input. And the report's proof that `runAutoContinue` bailed specifically
+at the task gate — "`pendingAttempt: null` proves it never reserved" — does not hold: a reserve
+followed by a rollback (from a plan-agent pause, a non-transport send failure, or several other
+paths) produces the identical snapshot.
+
+**What was real, and wider than reported.** `taskBlockStatus` can report `blocked` with
+`retryAt: null`, and the gate's deferral branch scheduled **nothing** in that case — a genuine,
+confirmed dead-stop. `retryAt` turns out to be null far more often than the code implies: the host
+deletes an idled session from its own status map the instant it goes idle, so the snapshot-idle-hold
+path that would otherwise produce a real `retryAt` almost never engages against a live host. Once
+that's traced through, the actual failure family is wider than "terminal task, stale message id":
+
+- A tracked task record stuck at `state: "running"` — set by a session-created or a live-poll
+  event, cleared only by reconciliation logic that never touches `state`, never TTL'd, never pruned
+  for a child that is still present in the host's own child list. This is the likeliest single
+  explanation for `autoTurns: 0` across a full 4-hour session with many human turns: it survives
+  every one of them.
+- `activeContinuations` is module-level and shared across every session; the v1 `dispose` path
+  never cleared it (v2's did). A hung in-flight call, or a dispose while one was in flight, leaves a
+  session id gated behind that check permanently — surviving even a plugin reload.
+- A non-transport send failure (a bad agent name, a 4xx, a state-write error) rolled back its
+  reservation and armed no retry, logging once and then repeating forever with the exact same
+  `pendingAttempt: null` snapshot.
+- `refreshLiveChildren`'s idle branch is effectively dead against the host's real status API (idle
+  sessions are deleted from the map, not reported idle in it), so the tracker could add blocking
+  records but essentially never clear one this way.
+
+**The fix, `0.3.4`.** Two invariants now hold everywhere the gate is evaluated: it never defers
+without scheduling a re-check (closes the unconditional dead-stop), and no block outlives a bound
+unless something genuinely refreshes it (closes the sticky-running and forward-crawling-terminal
+cases). Concretely: `TaskRecord` tracks `lastRunningAt` and a `running` record stops blocking once
+that goes stale; a `terminalUnreconciled` record stops blocking after a fixed grace period from its
+*first* terminal observation, and repeated status-snapshot re-observation is explicitly not new
+evidence for that clock (only the tool-output/message-observation channels that already assert
+fresh evidence restart it) — `markTerminal` is now idempotent against a repeated snapshot so the
+grace clock can't be pushed out forever; a child present in `session.children` but absent from a
+successfully-fetched status map is now read as settled instead of ignored; the v2 path gets the
+same gate fix plus real-timestamp assistant markers instead of bare ids; v1 `dispose` now clears
+`activeContinuations`; non-transport failures retry with a bound instead of stranding silently; and
+each deferral streak logs one breadcrumb line naming the blocking tasks and the chosen recheck
+delay. Full detail and the exact constants are in `CHANGELOG.md` under `[0.3.4]`.
+
+**What did not change.** The three tests that pin the original design intent —
+`test/server.test.ts:1295`, `:1340`, `:1393`, asserting a parent's own idle does not by itself fire
+continuation while a task is terminal-unreconciled — pass unmodified. The grace period is a
+deliberate, bounded narrowing of that invariant (wait for genuine orchestrator reconciliation for a
+few seconds, then stop waiting), not a repeal of it. The `0.2.0`–`0.3.3` compaction-recovery
+mechanism (§1–§2, and the purpose-bookkeeping fixes in `0.3.1`–`0.3.3`) is untouched by this fix and
+remains necessary on its own terms — see the correction note in §1 for how it relates to, and is
+distinct from, this task-deferral fix.
